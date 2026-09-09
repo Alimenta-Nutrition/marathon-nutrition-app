@@ -117,6 +117,7 @@ export const MealOptionsBottomSheet = ({
   onRate,
   onEdit,
   onSaveMeal,
+  onCopy,
   onGetRecipe,
   onRegenerate,
   onDelete,
@@ -172,6 +173,13 @@ export const MealOptionsBottomSheet = ({
                   style={{ marginLeft: 10 }}
                 />
               ) : null}
+            </TouchableOpacity>
+          ) : null}
+
+          {onCopy ? (
+            <TouchableOpacity style={styles.bottomSheetOption} onPress={onCopy}>
+              <Ionicons name="copy-outline" size={22} color={colors.primary} />
+              <Text style={styles.bottomSheetOptionText}>Copy meal</Text>
             </TouchableOpacity>
           ) : null}
 

@@ -8,10 +8,11 @@ import { computeNutritionTargets, withNumericIntensities, deriveWorkoutTiming } 
 import { estimateAndAdjust } from '../../shared/lib/macroEstimator.js';
 import { buildDayPrompt, formatTrainingDay } from '../../shared/lib/mealPromptBuilder.js';
 import { validateIngredients } from '../../shared/lib/validateIngredients.js';
-import { completeJSON, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
+import { completeJSON, completeMealWithUsda, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
 import { parseAIJson } from '../lib/parseAIJson.js';
 import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
+import { computeUsdaMacros, normalizeIngredientList } from '../lib/usdaMacros.js';
 import { buildGenerationMealSlots, toUiMealType, resolveMealToggles } from '../../shared/lib/mealSlots.js';
 import { recordUserStreak } from '../lib/recordStreak.js';
 
@@ -32,6 +33,15 @@ const AI_CONFIG = {
 function toMealString(name, macros) {
   if (!macros) return name;
   return `${name} (Cal: ${macros.calories}, P: ${macros.protein}g, C: ${macros.carbs}g, F: ${macros.fat}g)`;
+}
+
+function roundMacrosInt(macros) {
+  return {
+    calories: Math.round(macros.calories),
+    protein: Math.round(macros.protein),
+    carbs: Math.round(macros.carbs),
+    fat: Math.round(macros.fat),
+  };
 }
 
 export function createGenerateDayHandler(provider) {
@@ -194,7 +204,7 @@ export function createGenerateDayHandler(provider) {
 
       send('status', { message: `Generating ${emptySlots.length} meals for ${day}...` });
 
-      const prompt = buildDayPrompt({
+      const promptArgs = {
         mealBudgets: budgetsToGenerate,
         foodPreferences,
         dietaryRestrictions,
@@ -203,23 +213,78 @@ export function createGenerateDayHandler(provider) {
         avoidIngredients: [],
         previousDayMealNames,
         ragContext: ragContext || null,
-      });
-
-      let rawResponse;
-      try {
-        rawResponse = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
-      } catch (aiError) {
-        send('error', { message: aiError.message });
-        return res.end();
-      }
+      };
 
       let dayMealData;
-      try {
-        dayMealData = parseAIJson(rawResponse);
-      } catch {
-        console.error(`Failed to parse ${provider} response. Raw text:`, rawResponse);
-        send('error', { message: 'Failed to parse AI response' });
-        return res.end();
+      let rawResponse;
+      let prompt;
+      let usdaResults = {};
+      let toolRounds = 0;
+      let usedUsda = false;
+      const usdaStarted = Date.now();
+
+      const runCompleteJsonDay = async () => {
+        const jsonPrompt = buildDayPrompt({ ...promptArgs, useUsda: false });
+        const text = await completeJSON(provider, { prompt: jsonPrompt, ...AI_CONFIG[provider] });
+        let parsed;
+        try {
+          parsed = parseAIJson(text);
+        } catch {
+          console.error(`Failed to parse ${provider} response. Raw text:`, text);
+          throw new Error('Failed to parse AI response');
+        }
+        return { parsed, prompt: jsonPrompt, rawResponse: text };
+      };
+
+      if (provider === 'openai') {
+        try {
+          prompt = buildDayPrompt({ ...promptArgs, useUsda: true });
+          const usda = await completeMealWithUsda({
+            prompt,
+            reasoningEffort: 'none',
+          });
+          dayMealData = usda.parsed;
+          usdaResults = usda.usdaResults || {};
+          toolRounds = usda.toolRounds;
+          usedUsda = true;
+          rawResponse = JSON.stringify(usda.parsed);
+
+          const hasAnySlot = emptySlots.some(
+            (mt) => dayMealData?.[mt] || dayMealData?.[toUiMealType(mt)]
+          );
+          if (!hasAnySlot) {
+            throw new Error('USDA day response missing meal slots');
+          }
+
+          console.log(
+            `[generate-day] openai USDA tool_rounds=${toolRounds} ` +
+              `latency_ms=${Date.now() - usdaStarted}`
+          );
+        } catch (usdaErr) {
+          console.error(
+            `USDA day generation failed, falling back to completeJSON: ${usdaErr?.message || usdaErr}`
+          );
+          try {
+            const fallback = await runCompleteJsonDay();
+            dayMealData = fallback.parsed;
+            rawResponse = fallback.rawResponse;
+            prompt = fallback.prompt;
+            usedUsda = false;
+          } catch (aiError) {
+            send('error', { message: aiError.message });
+            return res.end();
+          }
+        }
+      } else {
+        try {
+          const fallback = await runCompleteJsonDay();
+          dayMealData = fallback.parsed;
+          rawResponse = fallback.rawResponse;
+          prompt = fallback.prompt;
+        } catch (aiError) {
+          send('error', { message: aiError.message });
+          return res.end();
+        }
       }
 
       if (debug) {
@@ -233,6 +298,7 @@ export function createGenerateDayHandler(provider) {
       }
 
       const generatedMealsObj = {};
+      const generatedV2 = {};
       const dailyTotals = { calories: 0, protein: 0, carbs: 0, fat: 0 };
 
       for (const mealType of emptySlots) {
@@ -246,15 +312,11 @@ export function createGenerateDayHandler(provider) {
           continue;
         }
 
-        let ingredients = mealData.ingredients
-          .filter((ing) => ing.name && ing.type && ing.grams > 0)
-          .map((ing) => ({
-            name: String(ing.name).trim(),
-            type: String(ing.type).trim().toLowerCase(),
-            grams: Math.round(parseFloat(ing.grams) || 0),
-          }));
-
-        ingredients = validateIngredients(ingredients, dislikes, dietaryRestrictions);
+        const ingredients = validateIngredients(
+          normalizeIngredientList(mealData.ingredients),
+          dislikes,
+          dietaryRestrictions
+        );
 
         if (ingredients.length === 0) {
           const fallback = mealData.meal_name || `Generated ${mealType}`;
@@ -264,29 +326,78 @@ export function createGenerateDayHandler(provider) {
         }
 
         const budget = budgetsToGenerate[mealType];
+        const mealName = mealData.meal_name || `${mealType} meal`;
+
+        if (usedUsda) {
+          const {
+            macros,
+            macrosRounded,
+            ingredients: v2Ingredients,
+            macro_source,
+            scaled,
+            scaleFactors,
+          } = computeUsdaMacros(ingredients, usdaResults, budget);
+
+          dailyTotals.calories += macrosRounded.calories;
+          dailyTotals.protein += macrosRounded.protein;
+          dailyTotals.carbs += macrosRounded.carbs;
+          dailyTotals.fat += macrosRounded.fat;
+
+          const mealString = toMealString(mealName, macrosRounded);
+          generatedMealsObj[outKey] = mealString;
+          generatedV2[outKey] = {
+            meal_name: mealName,
+            macros,
+            macro_source,
+            ingredients: v2Ingredients,
+            budget,
+            scaled,
+            scaleFactors: scaled ? scaleFactors : null,
+            tool_rounds: toolRounds,
+            provider: 'openai',
+          };
+
+          console.log(
+            `[generate-day] openai USDA ${outKey} macro_source=${macro_source} scaled=${scaled}`
+          );
+          send('meal', { mealType: outKey, meal: mealString, meal_v2: generatedV2[outKey], day });
+          continue;
+        }
+
         const result = estimateAndAdjust(ingredients, budget);
-        const macros = {
-          calories: Math.round(result.macros.calories),
-          protein: Math.round(result.macros.protein),
-          carbs: Math.round(result.macros.carbs),
-          fat: Math.round(result.macros.fat),
-        };
+        const macros = roundMacrosInt(result.macros);
 
         dailyTotals.calories += macros.calories;
         dailyTotals.protein += macros.protein;
         dailyTotals.carbs += macros.carbs;
         dailyTotals.fat += macros.fat;
 
-        const mealName = mealData.meal_name || `${mealType} meal`;
         const mealString = toMealString(mealName, macros);
 
         generatedMealsObj[outKey] = mealString;
-        send('meal', { mealType: outKey, meal: mealString, day });
+        if (provider === 'openai') {
+          generatedV2[outKey] = {
+            meal_name: mealName,
+            ingredients: result.ingredients,
+            macros,
+            budget,
+            scaled: result.scaled,
+            scaleFactors: result.scaleFactors,
+            macro_source: 'type_density',
+            provider: 'openai',
+          };
+        }
+        send('meal', { mealType: outKey, meal: mealString, meal_v2: generatedV2[outKey], day });
       }
 
       if (userId && weekStarting) {
         try {
           const updatedDayMeals = { ...dayMeals, ...generatedMealsObj };
+          if (provider === 'openai') {
+            for (const [key, v2] of Object.entries(generatedV2)) {
+              updatedDayMeals[`${key}_v2`] = v2;
+            }
+          }
           const updatedWeekMeals = { ...weekMeals, [day]: updatedDayMeals };
 
           await supabase.from('meal_plans').upsert(
@@ -309,6 +420,7 @@ export function createGenerateDayHandler(provider) {
         success: true,
         day,
         meals: generatedMealsObj,
+        meals_v2: generatedV2,
         dailyTotals,
         dailyTargets: nutrition.dailyMacros,
         provider,

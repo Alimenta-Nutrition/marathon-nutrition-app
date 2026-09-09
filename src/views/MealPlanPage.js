@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, RotateCcw, BarChart3, Star, ShoppingCart, ChevronLeft, ChevronRight, Copy, UtensilsCrossed, Heart, ChefHat, Sparkles, Apple, Check } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Plus, RotateCcw, BarChart3, Star, ShoppingCart, ChevronLeft, ChevronRight, Copy, UtensilsCrossed, Heart, ChefHat, Sparkles, Apple, Check, Trash2 } from 'lucide-react';
 import { Button } from '../components/shared/Button';
 import { MealPlanSkeleton } from '../components/shared/LoadingSkeleton';
 import { Tooltip } from '../components/shared/Tooltip';
@@ -12,6 +12,9 @@ import { calculateDayMacros, formatMealWithMacros } from '../services/mealServic
 import { MealPrepModal } from '../components/modals/MealPrepModal';
 import { AnalyticsModal } from '../components/modals/AnalyticsModal';
 import { parseMeal } from '../utils/mealHelpers';
+import { splitMealNameAndMacros } from '../../shared/lib/parseMealString';
+import { getMealSlotDisplay } from '../../shared/lib/mealSlotState';
+import { formatMealString } from '../../shared/lib/rebalanceDayMacros';
 import { useAuth } from '../context/AuthContext';
 import { authenticatedFetch, getApiUrl, getMealGenApiUrl } from '../../shared/services/api';
 import { ServingsPickerModal } from '../components/modals/ServingsPickerModal';
@@ -54,9 +57,14 @@ export const MealPlanPage = ({
   onGenerate,
   onGenerateDay,
   onGenerateSingleMeal,
+  onClearMeal,
+  onClearDay,
+  onClearAllMeals,
+  onCopyMeal,
   onRegenerate,
   onLoadWeek,
   onSave,
+  onPersistMealRename,
   isGenerating,
   isLoading,
   statusMessage,
@@ -159,12 +167,56 @@ export const MealPlanPage = ({
   };
 
   const handleCopyClick = (day, mealType, meal) => {
-    setCopyMealData({ meal, mealType, day });
+    setCopyMealData({
+      meal,
+      mealType,
+      day,
+      mealV2: mealPlan?.[day]?.[`${mealType}_v2`] || null,
+    });
     setShowCopyModal(true);
   };
 
-  const handleCopyMeal = (targetDay, mealType, meal) => {
-    onUpdate(targetDay, mealType, meal);
+  const handleCopyMeal = async (destinationDays) => {
+    if (typeof onCopyMeal !== 'function') {
+      destinationDays.forEach((day) => {
+        onUpdate(day, copyMealData.mealType, copyMealData.meal, copyMealData.mealV2);
+      });
+      return { success: true };
+    }
+    return onCopyMeal(copyMealData.day, copyMealData.mealType, destinationDays);
+  };
+
+  const handleClearMeal = async (day, mealType) => {
+    if (typeof onClearMeal !== 'function') return;
+    const ok = window.confirm(`Clear ${day}'s ${mealType}?`);
+    if (!ok) return;
+    const result = await onClearMeal(day, mealType);
+    if (result && result.success === false) {
+      setLocalStatusMessage(`❌ ${result.error || 'Could not clear meal'}`);
+      setTimeout(() => setLocalStatusMessage(''), 5000);
+    }
+  };
+
+  const handleClearDay = async (day) => {
+    if (typeof onClearDay !== 'function') return;
+    const ok = window.confirm(`Clear all meals for ${day}?`);
+    if (!ok) return;
+    const result = await onClearDay(day);
+    if (result && result.success === false) {
+      setLocalStatusMessage(`❌ ${result.error || 'Could not clear day'}`);
+      setTimeout(() => setLocalStatusMessage(''), 5000);
+    }
+  };
+
+  const handleClearWeek = async () => {
+    if (typeof onClearAllMeals !== 'function') return;
+    const ok = window.confirm('Clear all meals in the displayed week?');
+    if (!ok) return;
+    const result = await onClearAllMeals();
+    if (result && result.success === false) {
+      setLocalStatusMessage(`❌ ${result.error || 'Could not clear week'}`);
+      setTimeout(() => setLocalStatusMessage(''), 5000);
+    }
   };
 
   const handleLogClick = (day = 'monday', mealType = 'lunch') => {
@@ -172,8 +224,8 @@ export const MealPlanPage = ({
     setShowLogModal(true);
   };
 
-  const handleLogMeal = (day, mealType, description) => {
-    onUpdate(day, mealType, description);
+  const handleLogMeal = (day, mealType, description, structuredMeal) => {
+    onUpdate(day, mealType, description, structuredMeal);
     if (user?.id && !isGuest) {
       void recordStreakActivity(user.id);
     }
@@ -289,7 +341,9 @@ export const MealPlanPage = ({
 
     try {
       const mealString = mealPlan[day][mealType];
-      const description = parseMeal(mealString).name || String(mealString || '').trim();
+      const mealV2 = mealPlan[day]?.[`${mealType}_v2`];
+      const displayed = getMealSlotDisplay({ meal: mealString, mealV2, parseMeal });
+      const description = displayed.name || String(mealString || '').trim();
       const calMatch = typeof mealString === 'string' ? mealString.match(/Cal:\s*(\d+)/i) : null;
       const proteinMatch = typeof mealString === 'string' ? mealString.match(/P:\s*(\d+)g/i) : null;
       const carbsMatch = typeof mealString === 'string' ? mealString.match(/C:\s*(\d+)g/i) : null;
@@ -708,16 +762,33 @@ export const MealPlanPage = ({
     }
   };
 
-  // Auto-save meal plan when it changes (debounced)
+  const skipAutosaveAfterLoadRef = useRef(false);
+
   useEffect(() => {
-    if (!currentWeekStarting || !onSave || !hasMeals) return;
+    if (isLoading) {
+      skipAutosaveAfterLoadRef.current = true;
+      return;
+    }
+    if (!hasMeals) {
+      skipAutosaveAfterLoadRef.current = false;
+    }
+  }, [isLoading, hasMeals]);
+
+  // Auto-save meal plan when it changes (debounced). Hydration after a week
+  // load is not a user edit — do not schedule a POST for that snapshot.
+  useEffect(() => {
+    if (!currentWeekStarting || !onSave || !hasMeals || isLoading) return;
+    if (skipAutosaveAfterLoadRef.current) {
+      skipAutosaveAfterLoadRef.current = false;
+      return;
+    }
 
     const timeoutId = setTimeout(() => {
       onSave();
     }, 2000);
 
     return () => clearTimeout(timeoutId);
-  }, [mealPlan, currentWeekStarting, onSave, hasMeals]);
+  }, [mealPlan, currentWeekStarting, onSave, hasMeals, isLoading]);
 
   // ✅ Only show skeleton if loading AND we *don't* have meals yet
   if (isLoading && !hasMeals) {
@@ -879,6 +950,13 @@ export const MealPlanPage = ({
             icon: ChefHat,
             onClick: () => setShowMealPrepModal(true),
             show: true,
+          },
+          {
+            id: 'clear-week',
+            label: 'Clear week',
+            icon: Trash2,
+            onClick: handleClearWeek,
+            show: Boolean(onClearAllMeals && hasMeals),
           },
         ]
           .filter((a) => a.show)
@@ -1317,10 +1395,13 @@ export const MealPlanPage = ({
               completions={completions}
               onToggleMealCompletion={onToggleMealCompletion}
               onUpdate={onUpdate}
+              onPersistMealRename={onPersistMealRename}
               onRate={onRate}
               onRegenerate={handleRegenerate}
               onGetRecipe={getRecipe}
               onCopy={handleCopyClick}
+              onClearMeal={handleClearMeal}
+              onClearDay={handleClearDay}
               onLogClick={handleLogClick}
               onGenerateSingleMeal={onGenerateSingleMeal}
               onMealPrepClick={handleMealPrepClick}
@@ -1344,10 +1425,13 @@ export const MealPlanPage = ({
                 completions={completions}
                 onToggleMealCompletion={onToggleMealCompletion}
                 onUpdate={onUpdate}
+                onPersistMealRename={onPersistMealRename}
                 onRate={onRate}
                 onRegenerate={handleRegenerate}
                 onGetRecipe={getRecipe}
                 onCopy={handleCopyClick}
+                onClearMeal={handleClearMeal}
+                onClearDay={handleClearDay}
                 onLogClick={handleLogClick}
                 onGenerateSingleMeal={onGenerateSingleMeal}
                 onMealPrepClick={handleMealPrepClick}
@@ -1402,6 +1486,7 @@ export const MealPlanPage = ({
         isGuest={isGuest}
         defaultMealType={mealPrepDefaults.mealType}
         defaultDays={mealPrepDefaults.days}
+        weekStarting={currentWeekStarting}
       />
 
       <LogMealModal
@@ -1410,10 +1495,11 @@ export const MealPlanPage = ({
         onLog={handleLogMeal}
         defaultDay={logMealDefaults.day}
         defaultMealType={logMealDefaults.mealType}
-        savedMeals={savedMeals}              // Add
-        onUseSavedMeal={onUseSavedMeal}      // Add
-        onDeleteSavedMeal={onDeleteSavedMeal} // Add
-        isGuest={isGuest}                     // Add
+        savedMeals={savedMeals}
+        onUseSavedMeal={onUseSavedMeal}
+        onDeleteSavedMeal={onDeleteSavedMeal}
+        isGuest={isGuest}
+        weekStarting={currentWeekStarting}
       />
 
       <LogSnackModal
@@ -1446,10 +1532,13 @@ const DayMealsSection = ({
   completions,
   onToggleMealCompletion,
   onUpdate,
+  onPersistMealRename,
   onRate,
   onRegenerate,
   onGetRecipe,
   onCopy,
+  onClearMeal,
+  onClearDay,
   onLogClick,
   onGenerateSingleMeal,
   onMealPrepClick,
@@ -1470,27 +1559,38 @@ const DayMealsSection = ({
           {day}
         </h3>
 
-        {dayMacros.hasData ? (
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-            <span className="font-semibold tabular-nums" style={{ color: macroColors.calories }}>
-              {dayMacros.calories}
-              <span className="ml-1 font-medium text-muted-foreground">cal</span>
-            </span>
-            <span className="text-border">·</span>
-            <span className="font-medium tabular-nums" style={{ color: macroColors.protein }}>
-              {dayMacros.protein}g
-              <span className="ml-1 text-muted-foreground">P</span>
-            </span>
-            <span className="font-medium tabular-nums" style={{ color: macroColors.carbs }}>
-              {dayMacros.carbs}g
-              <span className="ml-1 text-muted-foreground">C</span>
-            </span>
-            <span className="font-medium tabular-nums" style={{ color: macroColors.fat }}>
-              {dayMacros.fat}g
-              <span className="ml-1 text-muted-foreground">F</span>
-            </span>
-          </div>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {onClearDay ? (
+            <button
+              type="button"
+              onClick={() => onClearDay(day)}
+              className="text-xs font-semibold text-muted-foreground hover:text-red-600"
+            >
+              Clear day
+            </button>
+          ) : null}
+          {dayMacros.hasData ? (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+              <span className="font-semibold tabular-nums" style={{ color: macroColors.calories }}>
+                {dayMacros.calories}
+                <span className="ml-1 font-medium text-muted-foreground">cal</span>
+              </span>
+              <span className="text-border">·</span>
+              <span className="font-medium tabular-nums" style={{ color: macroColors.protein }}>
+                {dayMacros.protein}g
+                <span className="ml-1 text-muted-foreground">P</span>
+              </span>
+              <span className="font-medium tabular-nums" style={{ color: macroColors.carbs }}>
+                {dayMacros.carbs}g
+                <span className="ml-1 text-muted-foreground">C</span>
+              </span>
+              <span className="font-medium tabular-nums" style={{ color: macroColors.fat }}>
+                {dayMacros.fat}g
+                <span className="ml-1 text-muted-foreground">F</span>
+              </span>
+            </div>
+          ) : null}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-6 sm:gap-y-8">
@@ -1512,12 +1612,15 @@ const DayMealsSection = ({
               day={day}
               mealType={mealType}
               meal={mealPlan[day]?.[mealType]}
+              mealV2={mealPlan[day]?.[`${mealType}_v2`]}
               rating={mealPlan[day]?.[`${mealType}_rating`] || 0}
               onUpdate={onUpdate}
+              onPersistMealRename={onPersistMealRename}
               onRate={onRate}
               onRegenerate={mealType === 'snacks' ? undefined : onRegenerate}
               onGetRecipe={onGetRecipe}
               onCopy={onCopy}
+              onClearMeal={mealType === 'snacks' ? undefined : onClearMeal}
               onLogClick={onLogClick}
               onGenerateSingleMeal={mealType === 'snacks' ? undefined : onGenerateSingleMeal}
               onMealPrepClick={mealType === 'snacks' ? undefined : onMealPrepClick}
@@ -1565,13 +1668,16 @@ const mealActionBtnClass =
 const MealCard = ({
   day, 
   mealType, 
-  meal, 
+  meal,
+  mealV2,
   rating,
   onUpdate, 
+  onPersistMealRename,
   onRate,
   onRegenerate, 
   onGetRecipe,
   onCopy,
+  onClearMeal,
   onLogClick,
   onGenerateSingleMeal,
   onMealPrepClick,
@@ -1591,31 +1697,47 @@ const MealCard = ({
   const isGeneratingMeal = meal === '__generating__';
   const isEmpty = !meal || (typeof meal === 'string' && !meal.trim());
   const mealLabel = mealType === 'snacks' ? 'Snack' : mealType;
-  const parsedMeal = !isEmpty && !isGeneratingMeal ? parseMeal(meal) : null;
+  const displayedMeal = !isEmpty && !isGeneratingMeal
+    ? getMealSlotDisplay({ meal, mealV2, parseMeal })
+    : null;
   const hasMacros = Boolean(
-    parsedMeal &&
-      (parsedMeal.calories > 0 ||
-        parsedMeal.protein > 0 ||
-        parsedMeal.carbs > 0 ||
-        parsedMeal.fat > 0)
+    displayedMeal &&
+      (displayedMeal.calories > 0 ||
+        displayedMeal.protein > 0 ||
+        displayedMeal.carbs > 0 ||
+        displayedMeal.fat > 0)
   );
+  const titleValue = displayedMeal
+    ? (hasMacros || displayedMeal.source === 'structured' ? displayedMeal.name : meal || '')
+    : '';
 
   const handleMealTextChange = (value) => {
-    // Textarea shows name only; strip pasted macros without eating trailing spaces.
-    const nextName = value.replace(
-      /\s*\(\s*Cal:\s*\d+\s*,\s*P:\s*\d+g\s*,\s*C:\s*\d+g\s*,\s*F:\s*\d+g\s*\)\s*$/i,
-      ''
-    );
+    const nextName = splitMealNameAndMacros(value).name;
 
-    if (hasMacros && parsedMeal) {
+    if (mealV2 && displayedMeal) {
+      onUpdate(
+        day,
+        mealType,
+        formatMealString(nextName, {
+          calories: displayedMeal.calories,
+          protein: displayedMeal.protein,
+          carbs: displayedMeal.carbs,
+          fat: displayedMeal.fat,
+        }),
+        { ...mealV2, meal_name: nextName }
+      );
+      return;
+    }
+
+    if (hasMacros && displayedMeal) {
       onUpdate(
         day,
         mealType,
         formatMealWithMacros(nextName, {
-          calories: parsedMeal.calories,
-          protein: parsedMeal.protein,
-          carbs: parsedMeal.carbs,
-          fat: parsedMeal.fat,
+          calories: displayedMeal.calories,
+          protein: displayedMeal.protein,
+          carbs: displayedMeal.carbs,
+          fat: displayedMeal.fat,
         })
       );
       return;
@@ -1795,6 +1917,17 @@ const MealCard = ({
               </button>
             </Tooltip>
           ) : null}
+          {onClearMeal ? (
+            <Tooltip text="Clear meal">
+              <button
+                type="button"
+                onClick={() => onClearMeal(day, mealType)}
+                className={`${mealActionBtnClass} hover:text-red-600`}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
+          ) : null}
           {onRegenerate ? (
             <Tooltip text="Regenerate meal">
               <button
@@ -1810,8 +1943,14 @@ const MealCard = ({
       </div>
 
       <textarea
-        value={hasMacros ? parsedMeal.name : meal || ''}
+        value={titleValue}
         onChange={(e) => handleMealTextChange(e.target.value)}
+        onBlur={() => {
+          if (isGuest || isGeneratingMeal || isEmpty) return;
+          const nextName = (displayedMeal?.name || splitMealNameAndMacros(titleValue).name || '').trim();
+          if (!nextName || typeof onPersistMealRename !== 'function') return;
+          void onPersistMealRename(day, mealType, nextName);
+        }}
         rows={3}
         placeholder={`Enter ${mealLabel.toLowerCase()}…`}
         className="w-full resize-y rounded-lg border-0 bg-transparent px-0 py-1 text-[15px] leading-relaxed text-foreground shadow-none placeholder:text-muted-foreground/70 focus:outline-none focus:ring-0"
@@ -1867,19 +2006,19 @@ const MealCard = ({
       {hasMacros ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-primary/15 pt-2.5 text-xs font-semibold tabular-nums">
           <span style={{ color: macroColors.calories }}>
-            {parsedMeal.calories}
+            {displayedMeal.calories}
             <span className="ml-1 font-medium opacity-75">cal</span>
           </span>
           <span style={{ color: macroColors.protein }}>
-            {parsedMeal.protein}g
+            {displayedMeal.protein}g
             <span className="ml-1 font-medium opacity-75">P</span>
           </span>
           <span style={{ color: macroColors.carbs }}>
-            {parsedMeal.carbs}g
+            {displayedMeal.carbs}g
             <span className="ml-1 font-medium opacity-75">C</span>
           </span>
           <span style={{ color: macroColors.fat }}>
-            {parsedMeal.fat}g
+            {displayedMeal.fat}g
             <span className="ml-1 font-medium opacity-75">F</span>
           </span>
         </div>

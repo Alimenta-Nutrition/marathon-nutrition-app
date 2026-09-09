@@ -273,7 +273,7 @@ async function streamSSEDay(url, data, onProgress) {
     let buffer = '';
     let lastProcessedIndex = 0;
     let currentEvent = null;
-    let finalResult = { success: false, day: data.day, meals: {} };
+    let finalResult = { success: false, day: data.day, meals: {}, meals_v2: {} };
 
     xhr.open('POST', url, true);
     xhr.setRequestHeader('Content-Type', 'application/json');
@@ -314,11 +314,15 @@ async function streamSSEDay(url, data, onProgress) {
               }
             } else if (currentEvent === 'meal' && payload.mealType && payload.meal) {
               finalResult.meals[payload.mealType] = payload.meal;
-              if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, day: payload.day });
+              if (payload.meal_v2) finalResult.meals_v2[payload.mealType] = payload.meal_v2;
+              if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, meal_v2: payload.meal_v2, day: payload.day });
             } else if (currentEvent === 'done') {
               finalResult.success = payload.success;
               if (payload.meals) {
                 finalResult.meals = { ...finalResult.meals, ...payload.meals };
+              }
+              if (payload.meals_v2) {
+                finalResult.meals_v2 = { ...finalResult.meals_v2, ...payload.meals_v2 };
               }
               if (onProgress) onProgress({ type: 'done', success: payload.success, day: payload.day });
             } else if (currentEvent === 'error') {
@@ -506,6 +510,7 @@ export const apiClient = {
         const decoder = new TextDecoder();
         let buffer = '';
         let meals = {};
+        let meals_v2 = {};
 
         while (true) {
           const { done, value } = await reader.read();
@@ -536,13 +541,17 @@ export const apiClient = {
                   }
                 } else if (currentEvent === 'meal' && payload.mealType && payload.meal) {
                   meals[payload.mealType] = payload.meal;
-                  if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, day: payload.day });
+                  if (payload.meal_v2) meals_v2[payload.mealType] = payload.meal_v2;
+                  if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, meal_v2: payload.meal_v2, day: payload.day });
                 } else if (currentEvent === 'done') {
                   if (payload.meals) {
                     meals = { ...meals, ...payload.meals };
                   }
+                  if (payload.meals_v2) {
+                    meals_v2 = { ...meals_v2, ...payload.meals_v2 };
+                  }
                   if (onProgress) onProgress({ type: 'done', success: payload.success, day: payload.day });
-                  return { success: payload.success, day: payload.day || data.day, meals };
+                  return { success: payload.success, day: payload.day || data.day, meals, meals_v2 };
                 } else if (currentEvent === 'error') {
                   throw new Error(payload.message || 'Unknown error');
                 }
@@ -554,7 +563,7 @@ export const apiClient = {
           }
         }
 
-        return { success: true, day: data.day, meals };
+        return { success: true, day: data.day, meals, meals_v2 };
       }
 
       // Fallback: read as text
@@ -675,7 +684,7 @@ export const apiClient = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      }, 30000);
+      }, 60000);
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -795,6 +804,104 @@ export const apiClient = {
     return response.json();
   },
 
+  async applyMealPrep(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/apply-meal-prep'),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
+  async logMeal(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/log-meal'),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
+  async deleteMeal(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/meal'),
+      {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
+  async copyMeal(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/copy-meal'),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
+  async getMeals({ start, end }) {
+    const params = new URLSearchParams({ start, end });
+    const response = await apiRequest(
+      getApiUrl(`/api/meals?${params.toString()}`),
+      { method: 'GET' },
+      30000
+    );
+    return response.json();
+  },
+
+  async getDaySettings({ start, end }) {
+    const params = new URLSearchParams({ start, end });
+    const response = await apiRequest(
+      getApiUrl(`/api/day-settings?${params.toString()}`),
+      { method: 'GET' },
+      30000
+    );
+    return response.json();
+  },
+
+  async patchDaySettings(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/day-settings'),
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
+  async patchMeal(data) {
+    const response = await apiRequest(
+      getApiUrl('/api/meal'),
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      },
+      30000
+    );
+    return response.json();
+  },
+
   async validateNutrition(mealData) {
     const response = await apiRequest(
       getApiUrl('/api/validate-nutrition'),
@@ -851,6 +958,7 @@ function parseSSEText(text, onProgress, weekStarting) {
 function parseSSETextDay(text, onProgress, day) {
   const lines = text.split('\n');
   let meals = {};
+  let meals_v2 = {};
   let currentEvent = null;
 
   for (let i = 0; i < lines.length; i++) {
@@ -868,13 +976,17 @@ function parseSSETextDay(text, onProgress, day) {
           if (onProgress) onProgress({ type: 'status', message: payload.message });
         } else if (currentEvent === 'meal' && payload.mealType && payload.meal) {
           meals[payload.mealType] = payload.meal;
-          if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, day: payload.day });
+          if (payload.meal_v2) meals_v2[payload.mealType] = payload.meal_v2;
+          if (onProgress) onProgress({ type: 'meal', mealType: payload.mealType, meal: payload.meal, meal_v2: payload.meal_v2, day: payload.day });
         } else if (currentEvent === 'done') {
           if (payload.meals) {
             meals = { ...meals, ...payload.meals };
           }
+          if (payload.meals_v2) {
+            meals_v2 = { ...meals_v2, ...payload.meals_v2 };
+          }
           if (onProgress) onProgress({ type: 'done', success: payload.success, day: payload.day });
-          return { success: payload.success, day: payload.day || day, meals };
+          return { success: payload.success, day: payload.day || day, meals, meals_v2 };
         } else if (currentEvent === 'error') {
           throw new Error(payload.message || 'Unknown error');
         }
@@ -885,5 +997,5 @@ function parseSSETextDay(text, onProgress, day) {
     }
   }
 
-  return { success: true, day, meals };
+  return { success: true, day, meals, meals_v2 };
 }

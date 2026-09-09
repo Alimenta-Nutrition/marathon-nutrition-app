@@ -13,6 +13,15 @@ const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'
 export const CopyMealModal = ({ isOpen, onClose, meal, mealType, currentDay, onCopy }) => {
   const [selectedDays, setSelectedDays] = useState([]);
   const [copied, setCopied] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [error, setError] = useState('');
+
+  const resetState = () => {
+    setSelectedDays([]);
+    setCopied(false);
+    setCopying(false);
+    setError('');
+  };
 
   const toggleDay = (day) => {
     setSelectedDays((prev) =>
@@ -30,19 +39,26 @@ export const CopyMealModal = ({ isOpen, onClose, meal, mealType, currentDay, onC
     );
   };
 
-  const handleCopy = () => {
-    if (selectedDays.length === 0) return;
+  const handleCopy = async () => {
+    if (selectedDays.length === 0 || copying) return;
 
-    selectedDays.forEach((day) => {
-      onCopy(day, mealType, meal);
-    });
-
-    setCopied(true);
-    setTimeout(() => {
-      setCopied(false);
-      setSelectedDays([]);
-      onClose();
-    }, 1000);
+    setCopying(true);
+    setError('');
+    try {
+      const result = await onCopy(selectedDays);
+      if (result && result.success === false) {
+        throw new Error(result.error || 'Failed to copy meal');
+      }
+      setCopied(true);
+      setTimeout(() => {
+        resetState();
+        onClose();
+      }, 1000);
+    } catch (err) {
+      setError(err.message || 'Failed to copy meal');
+    } finally {
+      setCopying(false);
+    }
   };
 
   const mealName = meal?.replace(/\(Cal:.*?\).*$/, '').trim() || '';
@@ -52,8 +68,7 @@ export const CopyMealModal = ({ isOpen, onClose, meal, mealType, currentDay, onC
       open={isOpen}
       onOpenChange={(open) => {
         if (!open) {
-          setSelectedDays([]);
-          setCopied(false);
+          resetState();
           onClose();
         }
       }}
@@ -114,16 +129,22 @@ export const CopyMealModal = ({ isOpen, onClose, meal, mealType, currentDay, onC
             ))}
           </div>
 
+          {error ? (
+            <p className="mb-3 text-sm text-red-600">{error}</p>
+          ) : null}
+
           <Button
             onClick={handleCopy}
-            disabled={selectedDays.length === 0 || copied}
+            disabled={selectedDays.length === 0 || copied || copying}
             variant={copied ? 'primary' : 'primary'}
             className={`w-full ${copied ? 'bg-green-500 hover:bg-green-500' : ''}`}
             icon={copied ? Check : Copy}
           >
             {copied
               ? 'Copied!'
-              : `Copy to ${selectedDays.length} day${selectedDays.length !== 1 ? 's' : ''}`}
+              : copying
+                ? 'Copying…'
+                : `Copy to ${selectedDays.length} day${selectedDays.length !== 1 ? 's' : ''}`}
           </Button>
         </div>
       </DialogContent>

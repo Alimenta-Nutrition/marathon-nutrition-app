@@ -28,6 +28,7 @@ export const useMealPlan = (_user, _isGuest, reloadKeyProp = 0) => {
     clearAllMeals: actions.clearAllMeals,
     clearDay: actions.clearDay,
     clearMeal: actions.clearMeal,
+    copyMeal: actions.copyMeal,
     getMealStatus: actions.getMealStatus,
     loadMealPlanByWeek: actions.loadMealPlanByWeek,
     saveCurrentMealPlan: actions.saveCurrentMealPlan,

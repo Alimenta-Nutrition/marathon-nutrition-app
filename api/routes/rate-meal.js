@@ -2,6 +2,7 @@
 import OpenAI from 'openai';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js'; // shared server-side client
 import { getRequestUserId } from '../lib/requestUser.js';
+import { dateFromWeekStartingAndDay, updateMealRating } from '../lib/mealStore.js';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -14,7 +15,7 @@ export default async function handler(req, res) {
 
   try {
     const userId = getRequestUserId(req);
-    let { mealDescription, mealType, rating, day } = req.body || {};
+    let { mealDescription, mealType, rating, day, weekStarting } = req.body || {};
 
     // Normalize/validate inputs
     rating = Number(rating);
@@ -87,11 +88,30 @@ export default async function handler(req, res) {
         console.error('❌ Error saving low-rating record:', error);
         throw error;
       }
+      }
+
+    let normalizedRatingUpdated = false;
+    const week = String(weekStarting || '').trim();
+    if (week && day && mealType) {
+      try {
+        const date = dateFromWeekStartingAndDay(week, day);
+        const updated = await updateMealRating({
+          userId,
+          date,
+          mealType,
+          slotIndex: 0,
+          rating,
+        });
+        normalizedRatingUpdated = Boolean(updated);
+      } catch (err) {
+        console.warn('[rate-meal] meals.rating update skipped:', err.message);
+      }
     }
 
     return res.status(200).json({
       success: true,
       message: 'Rating saved successfully',
+      normalizedRatingUpdated,
     });
   } catch (error) {
     console.error('❌ API Error (rate-meal):', error);

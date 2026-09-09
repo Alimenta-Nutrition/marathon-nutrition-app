@@ -1,10 +1,17 @@
 // src/hooks/useMealPlan.js
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiClient, authenticatedFetch, getApiUrl, getMealGenApiUrl } from '../../shared/services/api';
 import { capture } from '../lib/posthog';
 import { getLocalDateString } from '../dataClient';
+import {
+  canFetchNormalizedMealReads,
+  cloneEmptyWeek,
+  loadMergedWebMealWeek,
+} from '../../shared/lib/mergeNormalizedMeals';
+import { applyStructuredMealToDay, v2Key } from '../../shared/lib/mealSlotState';
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snacks', 'dessert'];
+const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 
 const getMealPlanSummary = (week = {}) => {
   let mealCount = 0;
@@ -39,16 +46,6 @@ const EMPTY_DAY = {
   snacks_rating: 0,
 };
 
-const EMPTY_WEEK = {
-  monday:    { ...EMPTY_DAY },
-  tuesday:   { ...EMPTY_DAY },
-  wednesday: { ...EMPTY_DAY },
-  thursday:  { ...EMPTY_DAY },
-  friday:    { ...EMPTY_DAY },
-  saturday:  { ...EMPTY_DAY },
-  sunday:    { ...EMPTY_DAY },
-};
-
 const getMondayOfCurrentWeek = () => {
   const today = new Date();
   const day = today.getDay(); // 0=Sun, 1=Mon,...
@@ -59,106 +56,132 @@ const getMondayOfCurrentWeek = () => {
   return monday.toISOString().split('T')[0];
 };
 
+async function fetchLegacyMealPlanWeek(userId, weekStarting) {
+  const res = await authenticatedFetch(
+    getApiUrl(
+      `/api/meal-plan?userId=${encodeURIComponent(userId)}&week=${encodeURIComponent(weekStarting)}`
+    )
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${text}`);
+  }
+  const data = await res.json();
+  if (!data.success) {
+    throw new Error(data.error || 'Failed to load meal plan');
+  }
+  const rawMeals = (data.mealPlan && data.mealPlan.meals) || data.meals || null;
+  const weekFromData =
+    (data.mealPlan && data.mealPlan.week_starting) || data.week_starting || weekStarting;
+  return { meals: rawMeals || {}, weekStarting: weekFromData };
+}
+
+async function fetchNormalizedMealsForRange({ start, end }) {
+  const result = await apiClient.getMeals({ start, end });
+  if (!result?.success) {
+    throw new Error(result?.error || 'Failed to load meals');
+  }
+  return Array.isArray(result.meals) ? result.meals : [];
+}
+
+async function fetchDaySettingsForRange({ start, end }) {
+  const result = await apiClient.getDaySettings({ start, end });
+  if (!result?.success) {
+    throw new Error(result?.error || 'Failed to load day settings');
+  }
+  return Array.isArray(result.daySettings) ? result.daySettings : [];
+}
+
 export const useMealPlan = (user, isGuest, reloadKey = 0) => {
-  const [mealPlan, setMealPlan] = useState(EMPTY_WEEK);
+  const [mealPlan, setMealPlan] = useState(cloneEmptyWeek);
+  const [normalizedMealsBySlot, setNormalizedMealsBySlot] = useState({});
   const [isGenerating, setIsGenerating] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [currentWeekStarting, setCurrentWeekStarting] = useState(getMondayOfCurrentWeek());
   const [isLoading, setIsLoading] = useState(false);
+  const loadGenerationRef = useRef(0);
+  // Same object reference as the last server hydrate. Autosave must not POST
+  // that snapshot (load must not count as a user edit).
+  const hydratedPlanRef = useRef(null);
+
+  const applyLoadedWeek = (result) => {
+    hydratedPlanRef.current = result.week;
+    setMealPlan(result.week);
+    setCurrentWeekStarting(result.weekStarting);
+    setNormalizedMealsBySlot(result.normalizedMealsBySlot || {});
+  };
 
   // -------- INITIAL / CURRENT WEEK LOAD --------
   useEffect(() => {
-    let cancelled = false;
-
-    if (!user || isGuest) {
+    if (!canFetchNormalizedMealReads(user, isGuest)) {
       console.log('useMealPlan: no user or guest → reset & stop');
-      setMealPlan(EMPTY_WEEK);
+      loadGenerationRef.current += 1;
+      const empty = cloneEmptyWeek();
+      hydratedPlanRef.current = empty;
+      setMealPlan(empty);
+      setNormalizedMealsBySlot({});
       setCurrentWeekStarting(getMondayOfCurrentWeek());
       setIsLoading(false);
-      return () => {
-        cancelled = true;
-      };
+      return undefined;
     }
+
+    const generation = ++loadGenerationRef.current;
+    const week = getMondayOfCurrentWeek();
+    setIsLoading(true);
 
     (async () => {
       try {
-        setIsLoading(true);
-        const week = getMondayOfCurrentWeek();
-
-        console.log('useMealPlan: fetching current week via /api/meal-plan', {
+        console.log('useMealPlan: fetching current week via /api/meal-plan + /api/meals', {
           userId: user.id,
           weekStarting: week,
         });
-
-        const res = await authenticatedFetch(
-          getApiUrl(
-            `/api/meal-plan?userId=${encodeURIComponent(user.id)}&week=${encodeURIComponent(
-              week
-            )}`
-          )
-        );
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          throw new Error(`HTTP ${res.status} ${text}`);
-        }
-
-        const data = await res.json();
-        console.log('useMealPlan: /api/meal-plan GET data', data);
-        if (cancelled) return;
-
-        // 🔧 Support both shapes:
-        // 1) { success, mealPlan: { week_starting, meals } }
-        // 2) { success, week_starting, meals }
-        const rawMeals =
-          (data.mealPlan && data.mealPlan.meals) ||
-          data.meals ||
-          null;
-
-        const weekFromData =
-          (data.mealPlan && data.mealPlan.week_starting) ||
-          data.week_starting ||
-          week;
-
-        if (data.success && rawMeals) {
-          const merged = { ...EMPTY_WEEK };
-          Object.keys(rawMeals).forEach((day) => {
-            if (merged[day]) {
-              merged[day] = { ...merged[day], ...rawMeals[day] };
-            }
-          });
-          setMealPlan(merged);
-          setCurrentWeekStarting(weekFromData);
-        } else {
-          console.log('useMealPlan: no existing mealPlan row → empty week');
-          setMealPlan(EMPTY_WEEK);
-          setCurrentWeekStarting(week);
-        }
+        const result = await loadMergedWebMealWeek({
+          weekStarting: week,
+          fetchLegacyWeek: (weekStart) => fetchLegacyMealPlanWeek(user.id, weekStart),
+          fetchNormalizedMeals: fetchNormalizedMealsForRange,
+          fetchDaySettings: fetchDaySettingsForRange,
+        });
+        if (loadGenerationRef.current !== generation) return;
+        applyLoadedWeek(result);
       } catch (err) {
         console.error('useMealPlan: error loading meal plan', err);
-        if (!cancelled) {
-          setMealPlan(EMPTY_WEEK);
-          setCurrentWeekStarting(getMondayOfCurrentWeek());
-        }
+        if (loadGenerationRef.current !== generation) return;
+        const empty = cloneEmptyWeek();
+        hydratedPlanRef.current = empty;
+        setMealPlan(empty);
+        setNormalizedMealsBySlot({});
+        setCurrentWeekStarting(getMondayOfCurrentWeek());
       } finally {
-        if (!cancelled) {
+        if (loadGenerationRef.current === generation) {
           setIsLoading(false);
         }
       }
     })();
 
     return () => {
-      cancelled = true;
+      loadGenerationRef.current += 1;
     };
   }, [user?.id, isGuest, reloadKey]);
 
   // -------- LOCAL MUTATORS --------
-  const updateMeal = (day, mealType, value) => {
+  const updateMeal = (day, mealType, value, structuredMeal) => {
     if (!day || !(day in mealPlan)) return;
-    setMealPlan((prev) => ({
-      ...prev,
-      [day]: { ...prev[day], [mealType]: value },
-    }));
+    setMealPlan((prev) => {
+      if (structuredMeal) {
+        return {
+          ...prev,
+          [day]: applyStructuredMealToDay(prev[day], mealType, {
+            legacyString: value,
+            structuredMeal,
+          }),
+        };
+      }
+      const nextDay = { ...prev[day], [mealType]: value };
+      if (!value || value === '__generating__') {
+        delete nextDay[v2Key(mealType)];
+      }
+      return { ...prev, [day]: nextDay };
+    });
   };
 
   /** Replace a full day object from the server (e.g. log-snack response).
@@ -174,17 +197,12 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
 
   const rateMeal = async (day, mealType, rating) => {
     if (!day || !(day in mealPlan)) return;
-    setMealPlan((prev) => ({
-      ...prev,
-      [day]: { ...prev[day], [`${mealType}_rating`]: rating },
-    }));
-    capture('meal_rated', { rating, meal_type: mealType });
+    const mealDescription = mealPlan[day]?.[mealType];
 
     if (user && !isGuest) {
       try {
-        const mealDescription = mealPlan[day][mealType];
-        if (mealDescription && mealDescription.trim()) {
-          await authenticatedFetch(getApiUrl('/api/rate-meal'), {
+        if (mealDescription && String(mealDescription).trim()) {
+          const res = await authenticatedFetch(getApiUrl('/api/rate-meal'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -193,13 +211,25 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
               mealType,
               rating,
               day,
+              weekStarting: currentWeekStarting,
             }),
           });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.success) {
+            throw new Error(data.error || `HTTP ${res.status}`);
+          }
         }
-      } catch {
-        // ignore; local rating stands
+      } catch (err) {
+        console.error('useMealPlan: error saving rating', err);
+        return;
       }
     }
+
+    setMealPlan((prev) => ({
+      ...prev,
+      [day]: { ...prev[day], [`${mealType}_rating`]: rating },
+    }));
+    capture('meal_rated', { rating, meal_type: mealType });
   };
 
   const generateMeals = async (userProfile, foodPreferences, workoutsByDay = {}) => {
@@ -320,7 +350,7 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
             if (event.message) setStatusMessage(`🔄 ${event.message}`);
           } else if (event.type === 'meal' && event.mealType && event.meal) {
             if (event.mealType === 'snacks' || event.mealType === 'snack') return;
-            updateMeal(day, event.mealType, event.meal);
+            updateMeal(day, event.mealType, event.meal, event.meal_v2);
             setStatusMessage(`✅ ${capitalize(event.mealType)} done!`);
           } else if (event.type === 'done') {
             setStatusMessage(`✅ ${capitalize(day)}'s meals generated!`);
@@ -335,7 +365,7 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
         // Final pass: apply any meals that may have been missed by SSE events
         Object.keys(result.meals).forEach((mealType) => {
           if (mealType === 'snacks' || mealType === 'snack') return;
-          updateMeal(day, mealType, result.meals[mealType]);
+          updateMeal(day, mealType, result.meals[mealType], result.meals_v2?.[mealType]);
         });
         // Clear any slots still stuck on __generating__ (skipped/error slots)
         MEAL_TYPES_LIST.forEach((mt) => {
@@ -408,9 +438,15 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
       });
 
       if (result?.success && result.meal) {
-        updateMeal(day, mealType, result.meal);
+        updateMeal(day, mealType, result.meal, result.meal_v2);
         if (user && !isGuest) {
-          const updatedPlan = { ...mealPlan, [day]: { ...mealPlan[day], [mealType]: result.meal } };
+          const updatedPlan = {
+            ...mealPlan,
+            [day]: applyStructuredMealToDay(mealPlan[day], mealType, {
+              legacyString: result.meal,
+              structuredMeal: result.meal_v2,
+            }),
+          };
           await authenticatedFetch(getApiUrl('/api/meal-plan'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -443,13 +479,14 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
           mealType,
           reason,
           currentMeal: mealPlan[day]?.[mealType] || '',
+          weekStarting: currentWeekStarting,
           localDate: getLocalDateString(),
         }),
       });
 
       const result = await response.json();
       if (result.success) {
-        updateMeal(day, mealType, result.meal);
+        updateMeal(day, mealType, result.meal, result.meal_v2);
         setStatusMessage(`✅ ${mealType} for ${day} regenerated!`);
         setTimeout(() => setStatusMessage(''), 3000);
         capture('meal_regenerated', { meal_type: mealType, day });
@@ -465,67 +502,256 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
 
   // -------- WEEK NAVIGATION / SAVE --------
   const loadMealPlanByWeek = async (weekStarting) => {
-    if (!user || isGuest) {
+    if (!canFetchNormalizedMealReads(user, isGuest)) {
       return { success: false, error: 'Guests cannot browse other weeks' };
     }
+    const generation = ++loadGenerationRef.current;
     try {
       setIsLoading(true);
 
-      console.log('useMealPlan: loadMealPlanByWeek via /api/meal-plan', {
+      console.log('useMealPlan: loadMealPlanByWeek via /api/meal-plan + /api/meals', {
         userId: user.id,
         weekStarting,
       });
 
-      const res = await authenticatedFetch(
-        getApiUrl(
-          `/api/meal-plan?userId=${encodeURIComponent(user.id)}&week=${encodeURIComponent(
-            weekStarting
-          )}`
-        )
-      );
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status} ${text}`);
+      const result = await loadMergedWebMealWeek({
+        weekStarting,
+        fetchLegacyWeek: (week) => fetchLegacyMealPlanWeek(user.id, week),
+        fetchNormalizedMeals: fetchNormalizedMealsForRange,
+        fetchDaySettings: fetchDaySettingsForRange,
+      });
+      if (loadGenerationRef.current !== generation) {
+        return { success: true, stale: true };
       }
-
-      const data = await res.json();
-      console.log('useMealPlan: /api/meal-plan GET by week data', data);
-
-      const rawMeals =
-        (data.mealPlan && data.mealPlan.meals) ||
-        data.meals ||
-        null;
-
-      const weekFromData =
-        (data.mealPlan && data.mealPlan.week_starting) ||
-        data.week_starting ||
-        weekStarting;
-
-      if (data.success && rawMeals) {
-        const merged = { ...EMPTY_WEEK };
-        Object.keys(rawMeals).forEach((day) => {
-          if (merged[day]) merged[day] = { ...merged[day], ...rawMeals[day] };
-        });
-        setMealPlan(merged);
-        setCurrentWeekStarting(weekFromData);
-        return { success: true };
-      } else {
-        setMealPlan(EMPTY_WEEK);
-        setCurrentWeekStarting(weekStarting);
-        return { success: false, error: 'No meal plan found for this week' };
-      }
+      applyLoadedWeek(result);
+      return { success: true };
     } catch (error) {
       console.error('useMealPlan: error loading week', error);
+      if (loadGenerationRef.current === generation) {
+        const empty = cloneEmptyWeek();
+        hydratedPlanRef.current = empty;
+        setMealPlan(empty);
+        setNormalizedMealsBySlot({});
+        setCurrentWeekStarting(weekStarting);
+      }
       return { success: false, error: error.message };
     } finally {
-      setIsLoading(false);
+      if (loadGenerationRef.current === generation) {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  const persistNormalizedDelete = async (payload) => {
+    if (!user || isGuest) return { success: true };
+    if (!currentWeekStarting) {
+      return { success: false, error: 'Missing week starting date. Please close and try again.' };
+    }
+    const result = await apiClient.deleteMeal({
+      ...payload,
+      weekStarting: currentWeekStarting,
+    });
+    if (!result?.success) {
+      return { success: false, error: result?.error || 'Failed to delete meal' };
+    }
+    return { success: true };
+  };
+
+  const persistLegacyPlan = async (plan) => {
+    if (!user || isGuest || !currentWeekStarting) return;
+    const res = await authenticatedFetch(getApiUrl('/api/meal-plan'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: user.id,
+        weekStarting: currentWeekStarting,
+        meals: plan,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+  };
+
+  const emptyWeekClone = () => cloneEmptyWeek();
+
+  const clearAllMeals = async () => {
+    try {
+      const persisted = await persistNormalizedDelete({ scope: 'week' });
+      if (!persisted.success) {
+        setStatusMessage(`❌ ${persisted.error}`);
+        setTimeout(() => setStatusMessage(''), 5000);
+        return persisted;
+      }
+    } catch (error) {
+      const message = error.message || 'Failed to clear meals';
+      setStatusMessage(`❌ ${message}`);
+      setTimeout(() => setStatusMessage(''), 5000);
+      return { success: false, error: message };
+    }
+
+    const empty = emptyWeekClone();
+    setMealPlan(empty);
+    try {
+      await persistLegacyPlan(empty);
+    } catch (error) {
+      console.error('Error clearing meals from database:', error);
+    }
+    return { success: true };
+  };
+
+  const clearDay = async (day) => {
+    if (!day || !(day in mealPlan)) return { success: false, error: 'Invalid day' };
+    try {
+      const persisted = await persistNormalizedDelete({ scope: 'day', day });
+      if (!persisted.success) {
+        setStatusMessage(`❌ ${persisted.error}`);
+        setTimeout(() => setStatusMessage(''), 5000);
+        return persisted;
+      }
+    } catch (error) {
+      const message = error.message || 'Failed to clear day';
+      setStatusMessage(`❌ ${message}`);
+      setTimeout(() => setStatusMessage(''), 5000);
+      return { success: false, error: message };
+    }
+
+    const updatedPlan = { ...mealPlan, [day]: { ...EMPTY_DAY } };
+    setMealPlan(updatedPlan);
+    try {
+      await persistLegacyPlan(updatedPlan);
+    } catch (error) {
+      console.error('Error clearing day from database:', error);
+    }
+    return { success: true };
+  };
+
+  const clearMeal = async (day, mealType) => {
+    if (!day || !(day in mealPlan)) return { success: false, error: 'Invalid day' };
+    if (!MEAL_TYPES.includes(mealType)) return { success: false, error: 'Invalid meal type' };
+    try {
+      const persisted = await persistNormalizedDelete({ scope: 'slot', day, mealType });
+      if (!persisted.success) {
+        setStatusMessage(`❌ ${persisted.error}`);
+        setTimeout(() => setStatusMessage(''), 5000);
+        return persisted;
+      }
+    } catch (error) {
+      const message = error.message || 'Failed to delete meal';
+      setStatusMessage(`❌ ${message}`);
+      setTimeout(() => setStatusMessage(''), 5000);
+      return { success: false, error: message };
+    }
+
+    const remainingAdjusted = (mealPlan[day]?.adjusted_meal_types || []).filter((mt) => mt !== mealType);
+    const nextDay = {
+      ...mealPlan[day],
+      [mealType]: '',
+      [`${mealType}_rating`]: 0,
+      adjusted_meal_types: remainingAdjusted,
+      targets_adjusted: remainingAdjusted.length > 0,
+    };
+    delete nextDay[v2Key(mealType)];
+    if (remainingAdjusted.length === 0) nextDay.over_budget = false;
+    const updatedPlan = { ...mealPlan, [day]: nextDay };
+    setMealPlan(updatedPlan);
+    try {
+      await persistLegacyPlan(updatedPlan);
+    } catch (error) {
+      console.error('Error clearing meal from database:', error);
+    }
+    return { success: true };
+  };
+
+  const copyMeal = async (sourceDay, sourceMealType, destinationDays) => {
+    if (!sourceDay || !(sourceDay in mealPlan)) {
+      return { success: false, error: 'Invalid source day' };
+    }
+    if (!MEAL_TYPES.includes(sourceMealType) || sourceMealType === 'snacks') {
+      return { success: false, error: 'Invalid meal type' };
+    }
+    const dests = (Array.isArray(destinationDays) ? destinationDays : []).filter(
+      (d) => d && d !== sourceDay && DAYS.includes(d)
+    );
+    if (dests.length === 0) {
+      return { success: false, error: 'Select at least one destination day' };
+    }
+    const sourceMeal = mealPlan[sourceDay]?.[sourceMealType];
+    const sourceV2 = mealPlan[sourceDay]?.[v2Key(sourceMealType)];
+    if (
+      !sourceMeal ||
+      typeof sourceMeal !== 'string' ||
+      !sourceMeal.trim() ||
+      sourceMeal === '__generating__'
+    ) {
+      return { success: false, error: 'No meal to copy' };
+    }
+
+    if (user && !isGuest) {
+      if (!currentWeekStarting) {
+        return { success: false, error: 'Missing week starting date. Please close and try again.' };
+      }
+      try {
+        const result = await apiClient.copyMeal({
+          sourceDay,
+          sourceMealType,
+          sourceWeekStarting: currentWeekStarting,
+          destinationDays: dests,
+          destinationWeekStarting: currentWeekStarting,
+        });
+        if (!result?.success) {
+          throw new Error(result?.error || 'Failed to copy meal');
+        }
+      } catch (error) {
+        const message = error.message || 'Failed to copy meal';
+        setStatusMessage(`❌ ${message}`);
+        setTimeout(() => setStatusMessage(''), 5000);
+        return { success: false, error: message };
+      }
+    }
+
+    const updatedPlan = { ...mealPlan };
+    dests.forEach((day) => {
+      updatedPlan[day] = applyStructuredMealToDay(updatedPlan[day], sourceMealType, {
+        legacyString: sourceMeal,
+        structuredMeal: sourceV2,
+      });
+    });
+    setMealPlan(updatedPlan);
+    return { success: true };
+  };
+
+  const persistMealRename = async (day, mealType, mealName) => {
+    if (!user || isGuest) return { success: true };
+    const name = String(mealName || '').trim();
+    if (!name || !day || !mealType || !currentWeekStarting) {
+      return { success: false, error: 'Missing rename fields' };
+    }
+    try {
+      const result = await apiClient.patchMeal({
+        action: 'rename',
+        weekStarting: currentWeekStarting,
+        day,
+        mealType,
+        mealName: name,
+      });
+      if (!result?.success) {
+        throw new Error(result?.error || 'Failed to rename meal');
+      }
+      return { success: true, updated: result.updated !== false };
+    } catch (error) {
+      console.error('useMealPlan: error renaming meal', error);
+      return { success: false, error: error.message };
     }
   };
 
   const saveCurrentMealPlan = async () => {
     if (!user || isGuest || !currentWeekStarting) {
       return { success: false, error: 'Cannot save meal plan' };
+    }
+    if (mealPlan === hydratedPlanRef.current) {
+      return { success: true, skipped: true };
     }
     try {
       console.log('useMealPlan: saving meal plan via /api/meal-plan', {
@@ -563,11 +789,17 @@ export const useMealPlan = (user, isGuest, reloadKey = 0) => {
     generateDay,
     generateSingleMeal,
     regenerateMeal,
+    clearAllMeals,
+    clearDay,
+    clearMeal,
+    copyMeal,
     loadMealPlanByWeek,
+    persistMealRename,
     saveCurrentMealPlan,
     isGenerating,
     isLoading,
     statusMessage,
     currentWeekStarting,
+    normalizedMealsBySlot,
   };
 };

@@ -100,6 +100,7 @@ mount('/api/generate-day-web-openai', () => import('./routes/generate-day-web-op
 mount('/api/generate-meal-prep', () => import('./routes/generate-meal-prep.js'));
 mount('/api/generate-meal-prep-gemini', () => import('./routes/generate-meal-prep-gemini.js'));
 mount('/api/generate-meal-prep-openai', () => import('./routes/generate-meal-prep-openai.js'));
+mount('/api/apply-meal-prep', () => import('./routes/apply-meal-prep.js'));
 
 mount('/api/generate-single-meal', () => import('./routes/generate-single-meal.js'));
 mount('/api/generate-single-meal-gemini', () => import('./routes/generate-single-meal-gemini.js'));
@@ -109,10 +110,17 @@ mount('/api/regenerate-meal', () => import('./routes/regenerate-meal.js'));
 mount('/api/regenerate-meal-gemini', () => import('./routes/regenerate-meal-gemini.js'));
 mount('/api/regenerate-meal-openai', () => import('./routes/regenerate-meal-openai.js'));
 
+mount('/api/test/meal-generation-comparison', () => import('./routes/test/meal-generation-comparison.js'));
+
 mount('/api/generate-meals', () => import('./routes/generate-meals.js'));
 mount('/api/generate-grocery-list', () => import('./routes/generate-grocery-list.js'));
 mount('/api/rate-meal', () => import('./routes/rate-meal.js'));
 mount('/api/log-snack', () => import('./routes/log-snack.js'));
+mount('/api/log-meal', () => import('./routes/log-meal.js'));
+mount('/api/meal', () => import('./routes/meal.js'));
+mount('/api/meals', () => import('./routes/meals.js'));
+mount('/api/copy-meal', () => import('./routes/copy-meal.js'));
+mount('/api/day-settings', () => import('./routes/day-settings.js'));
 
 mount('/api/pro/clients', () => import('./routes/pro/clients.js'));
 mount('/api/pro/dashboard', () => import('./routes/pro/dashboard.js'));

@@ -149,6 +149,10 @@ export default function MealsPage() {
             { workouts, tomorrowWorkouts }
           );
         }}
+        onClearMeal={mealPlan.clearMeal}
+        onClearDay={mealPlan.clearDay}
+        onClearAllMeals={mealPlan.clearAllMeals}
+        onCopyMeal={mealPlan.copyMeal}
         onRegenerate={async (day, mealType, reason, context) => {
           const { workouts, tomorrowWorkouts } = await resolveWorkoutsForMealDay(day);
           return mealPlan.regenerateMeal(day, mealType, reason, {
@@ -161,6 +165,7 @@ export default function MealsPage() {
         }}
         onLoadWeek={mealPlan.loadMealPlanByWeek}
         onSave={mealPlan.saveCurrentMealPlan}
+        onPersistMealRename={mealPlan.persistMealRename}
         isGenerating={mealPlan.isGenerating}
         isLoading={mealPlan.isLoading}
         statusMessage={mealPlan.statusMessage}

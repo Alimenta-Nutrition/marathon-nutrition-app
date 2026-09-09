@@ -333,6 +333,7 @@ export const MealPrepModal = ({
   isGuest,
   defaultMealType,
   userId,
+  weekStarting,
   canGenerate = true,
   mealPrepRemaining = Infinity,
   onGenerateSuccess,
@@ -344,6 +345,7 @@ export const MealPrepModal = ({
   const [selectedDays, setSelectedDays] = useState([]);
   const [options, setOptions] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
   const [error, setError] = useState('');
   const [applied, setApplied] = useState(false);
   const { colors } = useTheme();
@@ -416,14 +418,46 @@ export const MealPrepModal = ({
   };
 
   const handleSelectOption = async (option) => {
-    selectedDays.forEach((day) => {
-      onApply(day, selectedMealType, option.fullDescription);
-    });
+    if (applied || isApplying) return;
 
-    setApplied(true);
-    setTimeout(() => {
-      handleClose();
-    }, 1500);
+    if (!option?.meal_v2) {
+      setError('This option is missing structured meal data and cannot be applied.');
+      return;
+    }
+
+    if (!isGuest && !weekStarting) {
+      setError('Missing week starting date. Please close and try again.');
+      return;
+    }
+
+    setIsApplying(true);
+    setError('');
+
+    try {
+      for (const day of selectedDays) {
+        if (!isGuest) {
+          const result = await apiClient.applyMealPrep({
+            day,
+            mealType: selectedMealType,
+            weekStarting,
+            mealV2: option.meal_v2,
+          });
+          if (!result.success) {
+            throw new Error(result.error || 'Failed to apply meal prep');
+          }
+        }
+        onApply(day, selectedMealType, option.fullDescription, option.meal_v2);
+      }
+
+      setApplied(true);
+      setTimeout(() => {
+        handleClose();
+      }, 1500);
+    } catch (err) {
+      setError(err.message || 'Failed to apply meal prep');
+    } finally {
+      setIsApplying(false);
+    }
   };
 
   const handleClose = () => {
@@ -433,6 +467,7 @@ export const MealPrepModal = ({
     setOptions([]);
     setError('');
     setApplied(false);
+    setIsApplying(false);
     onClose();
   };
 
@@ -648,8 +683,8 @@ export const MealPrepModal = ({
                 <TouchableOpacity
                   key={idx}
                   style={styles.optionCard}
-                  onPress={() => !applied && handleSelectOption(option)}
-                  disabled={applied}
+                  onPress={() => !applied && !isApplying && handleSelectOption(option)}
+                  disabled={applied || isApplying}
                 >
                   <View style={styles.optionContent}>
                     <Text style={styles.optionName}>{option.name}</Text>
@@ -701,6 +736,21 @@ export const MealPrepModal = ({
               ))}
             </View>
 
+            {error ? (
+              <View style={styles.errorContainer}>
+                <Text style={styles.errorText}>{error}</Text>
+              </View>
+            ) : null}
+
+            {isApplying ? (
+              <View style={styles.successContainer}>
+                <ActivityIndicator size="small" color={colors.primary} />
+                <Text style={styles.successText}>
+                  Applying to {selectedDays.length} day{selectedDays.length === 1 ? '' : 's'}...
+                </Text>
+              </View>
+            ) : null}
+
             {applied && (
               <View style={styles.successContainer}>
                 <Ionicons name="checkmark-circle" size={24} color={colors.success} />
@@ -713,7 +763,7 @@ export const MealPrepModal = ({
             <TouchableOpacity
               style={[styles.secondaryButton, styles.fullWidthButton]}
               onPress={handleBack}
-              disabled={applied}
+              disabled={applied || isApplying}
             >
               <Ionicons name="chevron-back" size={18} color={colors.textSecondary} />
               <Text style={styles.secondaryButtonText}>Back to Days</Text>

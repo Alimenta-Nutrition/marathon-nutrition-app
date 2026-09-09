@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../context/ThemeContext';
-import { macroColors } from '../../../shared/lib/macroColors';
+import { getMealSlotDisplay } from '../../../shared/lib/mealSlotState';
 
 const MEAL_LABELS = {
   breakfast: 'Breakfast',
@@ -28,6 +28,7 @@ const softMacroBg = (hex, isDarkMode) => {
 export const MealCard = ({
   mealType,
   meal,
+  mealV2,
   rating,
   onRate,
   onMealPress,
@@ -42,7 +43,7 @@ export const MealCard = ({
   const { colors, isDarkMode } = useTheme();
   const styles = getStyles(colors, isDarkMode);
   const isGenerating = meal === '__generating__';
-  const parsed = isGenerating ? null : parseMeal(meal);
+  const parsed = isGenerating ? null : getMealSlotDisplay({ meal, mealV2, parseMeal });
   const hasMeal = !!(meal && meal.trim() && !isGenerating);
 
   const scaleAnim = useRef(new Animated.Value(1)).current;

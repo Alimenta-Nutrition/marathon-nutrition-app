@@ -13,6 +13,8 @@
 
 import { getRemainingBudget } from './tdeeCalc.js';
 import { MIN_SCALE } from './macroEstimator.js';
+import { parseMealString } from './parseMealString.js';
+import { scaleIngredientByGrams, sumLoggedIngredientMacros } from './loggedMealMacros.js';
 
 const MACRO_KEYS = ['calories', 'protein', 'carbs', 'fat'];
 const REBALANCE_MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'dessert'];
@@ -24,28 +26,7 @@ const REBALANCE_MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'dessert'];
  * @returns {{ name: string, calories: number, protein: number, carbs: number, fat: number }}
  */
 export function parseMealMacros(mealString) {
-  if (!mealString || typeof mealString !== 'string') {
-    return { name: '', calories: 0, protein: 0, carbs: 0, fat: 0 };
-  }
-
-  const calMatch = mealString.match(/Cal:\s*(\d+)/i);
-  const proteinMatch = mealString.match(/P:\s*(\d+)\s*g/i);
-  const carbsMatch = mealString.match(/C:\s*(\d+)\s*g/i);
-  const fatMatch = mealString.match(/F:\s*(\d+)\s*g/i);
-  const nameMatch = mealString.match(
-    /\s*\(\s*Cal:\s*\d+\s*,\s*P:\s*\d+g\s*,\s*C:\s*\d+g\s*,\s*F:\s*\d+g\s*\)\s*$/i
-  );
-  const name = nameMatch
-    ? mealString.slice(0, nameMatch.index).trim()
-    : mealString.trim();
-
-  return {
-    name,
-    calories: calMatch ? parseInt(calMatch[1], 10) : 0,
-    protein: proteinMatch ? parseInt(proteinMatch[1], 10) : 0,
-    carbs: carbsMatch ? parseInt(carbsMatch[1], 10) : 0,
-    fat: fatMatch ? parseInt(fatMatch[1], 10) : 0,
-  };
+  return parseMealString(mealString, { trimName: true });
 }
 
 /**
@@ -62,6 +43,49 @@ export function formatMealString(name, macros) {
 
 function isFilledMeal(val) {
   return Boolean(val && typeof val === 'string' && val.trim() && val !== '__generating__');
+}
+
+function v2Key(mealType) {
+  return `${mealType}_v2`;
+}
+
+/**
+ * Scale structured ingredients so meal calories match a rebalance target.
+ * Per-macro independent rebalance cannot be applied to USDA rows without
+ * violating meals.macros == ingredient sum, so portions scale by calorie ratio
+ * and meal totals become the ingredient sum.
+ */
+export function scaleIngredientsByCalorieRatio(ingredients, fromCalories, toCalories) {
+  const list = Array.isArray(ingredients) ? ingredients : [];
+  const from = Number(fromCalories);
+  const to = Number(toCalories);
+  if (list.length === 0) return [];
+  if (!Number.isFinite(from) || from <= 0) return list.map((ing) => ({ ...ing }));
+  const ratio = Number.isFinite(to) && to >= 0 ? to / from : 1;
+  return list.map((ing) => {
+    const prevGrams = Number(ing?.grams) || 0;
+    return scaleIngredientByGrams(ing, prevGrams * ratio);
+  });
+}
+
+function snapshotSlot(dayMeals, mt) {
+  const parsed = parseMealMacros(dayMeals[mt]);
+  const v2 = dayMeals[v2Key(mt)];
+  const snap = {
+    calories: parsed.calories,
+    protein: parsed.protein,
+    carbs: parsed.carbs,
+    fat: parsed.fat,
+  };
+  if (v2 && typeof v2 === 'object') {
+    snap.meal_name = v2.meal_name || parsed.name;
+    snap.macro_source = v2.macro_source || null;
+    snap.provider = v2.provider || null;
+    if (Array.isArray(v2.ingredients) && v2.ingredients.length > 0) {
+      snap.ingredients = v2.ingredients;
+    }
+  }
+  return snap;
 }
 
 /**
@@ -85,13 +109,7 @@ function ensureOriginalTargets(dayMeals, mealTypes) {
   const snapshot = {};
   for (const mt of mealTypes) {
     if (!isFilledMeal(dayMeals[mt])) continue;
-    const parsed = parseMealMacros(dayMeals[mt]);
-    snapshot[mt] = {
-      calories: parsed.calories,
-      protein: parsed.protein,
-      carbs: parsed.carbs,
-      fat: parsed.fat,
-    };
+    snapshot[mt] = snapshotSlot(dayMeals, mt);
   }
   return snapshot;
 }
@@ -110,7 +128,23 @@ export function restoreDayFromOriginalTargets(dayMeals) {
   for (const mt of REBALANCE_MEAL_TYPES) {
     if (!originals[mt] || !isFilledMeal(next[mt])) continue;
     const parsed = parseMealMacros(next[mt]);
-    next[mt] = formatMealString(parsed.name, originals[mt]);
+    const name = originals[mt].meal_name || parsed.name;
+    next[mt] = formatMealString(name, originals[mt]);
+    if (Array.isArray(originals[mt].ingredients) && originals[mt].ingredients.length > 0) {
+      next[v2Key(mt)] = {
+        ...(next[v2Key(mt)] && typeof next[v2Key(mt)] === 'object' ? next[v2Key(mt)] : {}),
+        meal_name: name,
+        macros: {
+          calories: originals[mt].calories,
+          protein: originals[mt].protein,
+          carbs: originals[mt].carbs,
+          fat: originals[mt].fat,
+        },
+        macro_source: originals[mt].macro_source || next[v2Key(mt)]?.macro_source || null,
+        provider: originals[mt].provider || next[v2Key(mt)]?.provider || null,
+        ingredients: originals[mt].ingredients,
+      };
+    }
   }
 
   delete next.original_targets;
@@ -120,6 +154,7 @@ export function restoreDayFromOriginalTargets(dayMeals) {
   next.snacks = '';
   next.snacks_user_logged = false;
   next.snacks_rating = next.snacks_rating || 0;
+  delete next.snacks_v2;
 
   return next;
 }
@@ -235,12 +270,45 @@ export function rebalanceDayMacros({
   next.adjusted_meal_types = adjusted;
   next.targets_adjusted = adjusted.length > 0;
 
+  applyStructuredRebalance(next, originalTargets, adjusted);
+
   return {
     dayMeals: next,
     over_budget: overBudget,
     adjusted_meal_types: adjusted,
     rebalanced: true,
   };
+}
+
+/**
+ * After string rebalance, scale snapshotted ingredients so USDA/type_density
+ * meals stay nutritionally consistent (meal totals = ingredient sum).
+ */
+export function applyStructuredRebalance(dayMeals, originalTargets, adjustedMealTypes) {
+  const next = dayMeals;
+  for (const mt of adjustedMealTypes || []) {
+    const snap = originalTargets?.[mt];
+    if (!snap || !Array.isArray(snap.ingredients) || snap.ingredients.length === 0) continue;
+
+    const assigned = parseMealMacros(next[mt]);
+    const scaled = scaleIngredientsByCalorieRatio(
+      snap.ingredients,
+      snap.calories,
+      assigned.calories
+    );
+    const summed = sumLoggedIngredientMacros(scaled);
+    const name = snap.meal_name || assigned.name;
+    next[mt] = formatMealString(name, summed);
+    next[v2Key(mt)] = {
+      ...(next[v2Key(mt)] && typeof next[v2Key(mt)] === 'object' ? next[v2Key(mt)] : {}),
+      meal_name: name,
+      macros: summed,
+      macro_source: snap.macro_source || next[v2Key(mt)]?.macro_source || null,
+      provider: snap.provider || next[v2Key(mt)]?.provider || null,
+      ingredients: scaled,
+    };
+  }
+  return next;
 }
 
 export { MIN_SCALE as REBALANCE_FLOOR };

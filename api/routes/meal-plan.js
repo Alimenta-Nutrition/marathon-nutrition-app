@@ -12,6 +12,42 @@ function getMondayOfCurrentWeek() {
   return monday.toISOString().split('T')[0];
 }
 
+function mealNameFromString(mealString) {
+  if (!mealString || typeof mealString !== 'string') return '';
+  const idx = mealString.indexOf('(Cal:');
+  const name = idx === -1 ? mealString : mealString.slice(0, idx);
+  return name.trim();
+}
+
+function mealNameFromV2(v2) {
+  if (!v2 || typeof v2 !== 'object') return '';
+  return String(v2.meal_name || '').trim();
+}
+
+function mergeV2Keys(existingMeals, incomingMeals) {
+  if (!existingMeals || !incomingMeals) return incomingMeals;
+  const merged = { ...incomingMeals };
+  for (const day of Object.keys(existingMeals)) {
+    if (typeof existingMeals[day] !== 'object' || existingMeals[day] == null) continue;
+    merged[day] = { ...(merged[day] || {}) };
+    for (const key of Object.keys(existingMeals[day])) {
+      if (!key.endsWith('_v2') || key in merged[day]) continue;
+
+      const slotKey = key.slice(0, -3);
+      const incomingString = merged[day][slotKey];
+      if (typeof incomingString === 'string') {
+        if (!incomingString.trim()) continue;
+        const stringName = mealNameFromString(incomingString);
+        const v2Name = mealNameFromV2(existingMeals[day][key]);
+        if (stringName !== v2Name) continue;
+      }
+
+      merged[day][key] = existingMeals[day][key];
+    }
+  }
+  return merged;
+}
+
 export default async function handler(req, res) {
   if (req.method === 'GET') {
     const userId = getRequestUserId(req);
@@ -97,7 +133,7 @@ export default async function handler(req, res) {
       // Manual "upsert": check if row exists
       const { data: existing, error: selectError } = await supabaseAdmin
         .from('meal_plans')
-        .select('id')
+        .select('id, meals')
         .eq('user_id', userId)
         .eq('week_starting', weekStarting)
         .maybeSingle();
@@ -110,13 +146,17 @@ export default async function handler(req, res) {
         });
       }
 
+      const mealsToSave = existing?.meals
+        ? mergeV2Keys(existing.meals, meals)
+        : meals;
+
       let data, error;
 
       if (existing) {
         ({ data, error } = await supabaseAdmin
           .from('meal_plans')
           .update({
-            meals,
+            meals: mealsToSave,
             updated_at: new Date().toISOString(),
           })
           .eq('id', existing.id)
@@ -128,7 +168,7 @@ export default async function handler(req, res) {
           .insert({
             user_id: userId,
             week_starting: weekStarting,
-            meals,
+            meals: mealsToSave,
             updated_at: new Date().toISOString(),
           })
           .select()

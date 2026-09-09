@@ -1,5 +1,10 @@
 // Meal-related utility functions
 
+import { MEAL_MACRO_SUFFIX_RE } from '../../shared/lib/parseMealString';
+import { getMealSlotDisplay } from '../../shared/lib/mealSlotState';
+
+const MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snacks', 'dessert'];
+
 /**
  * Calculate total macros for a day's meals
  */
@@ -10,22 +15,25 @@ export const calculateDayMacros = (dayMeals) => {
   let totalFat = 0;
   let hasData = false;
 
-  Object.values(dayMeals).forEach((meal) => {
-    if (typeof meal !== 'string' || !meal) return;
-    
-    // Parse macros from meal string (format: "Meal name (Cal: 350, P: 15g, C: 45g, F: 8g)")
-    const calMatch = meal.match(/Cal:\s*(\d+)/);
-    const proteinMatch = meal.match(/P:\s*(\d+)g/);
-    const carbsMatch = meal.match(/C:\s*(\d+)g/);
-    const fatMatch = meal.match(/F:\s*(\d+)g/);
+  if (!dayMeals || typeof dayMeals !== 'object') {
+    return { calories: 0, protein: 0, carbs: 0, fat: 0, hasData: false };
+  }
 
-    if (calMatch) {
-      totalCalories += parseInt(calMatch[1]);
+  MEAL_TYPES.forEach((mealType) => {
+    const meal = dayMeals[mealType];
+    if (typeof meal !== 'string' || !meal || meal === '__generating__') return;
+
+    const parsed = getMealSlotDisplay({
+      meal,
+      mealV2: dayMeals[`${mealType}_v2`],
+    });
+    if (parsed.calories || parsed.protein || parsed.carbs || parsed.fat) {
       hasData = true;
     }
-    if (proteinMatch) totalProtein += parseInt(proteinMatch[1]);
-    if (carbsMatch) totalCarbs += parseInt(carbsMatch[1]);
-    if (fatMatch) totalFat += parseInt(fatMatch[1]);
+    totalCalories += parsed.calories;
+    totalProtein += parsed.protein;
+    totalCarbs += parsed.carbs;
+    totalFat += parsed.fat;
   });
 
   return {
@@ -92,9 +100,7 @@ export const validateDayMacros = (dayMacros, targetMacros, tolerance = 0.15) => 
 export const extractMealName = (mealString) => {
   if (!mealString) return '';
   const s = String(mealString);
-  const macroSuffixMatch = s.match(
-    /\(\s*Cal:\s*\d+\s*,\s*P:\s*\d+g\s*,\s*C:\s*\d+g\s*,\s*F:\s*\d+g\s*\)\s*$/i
-  );
+  const macroSuffixMatch = s.match(MEAL_MACRO_SUFFIX_RE);
   if (!macroSuffixMatch) return s;
   let name = s.slice(0, macroSuffixMatch.index);
   if (name.endsWith(' ')) name = name.slice(0, -1);

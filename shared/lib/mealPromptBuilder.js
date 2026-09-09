@@ -113,8 +113,41 @@ function buildVarietyBlock({ avoidIngredients, alreadyGeneratedToday, ragContext
   return block;
 }
 
-function buildMacroBudgetBlock(budget) {
+/**
+ * Tool + portion instructions when generation uses lookup_nutrition.
+ * @param {{ calories: number, protein: number, carbs: number, fat: number }} budget
+ */
+export function buildUsdaToolInstructions(budget) {
+  const calories = budget?.calories ?? 0;
+  const protein = budget?.protein ?? 0;
+  const carbs = budget?.carbs ?? 0;
+  const fat = budget?.fat ?? 0;
+
+  return `You have access to a lookup_nutrition tool. After choosing ingredients, call it with cooked, single-ingredient names (e.g. "chicken breast cooked", "white rice cooked") to get USDA macros per 100g. Use those values to set gram amounts.
+
+Stay within 5% of these targets: ${calories} cal, ${protein}g protein, ${carbs}g carbs, ${fat}g fat.
+
+PORTION GUARDRAILS — prefer a realistic plate over perfect math:
+- Protein foods: 120–250g cooked
+- Carb foods: 150–300g cooked; if carb target > 80g, include 2+ carb ingredients
+- Vegetables: 80–200g
+- Added fats: 5–20g
+Do not use huge single portions (e.g. 550g rice) to hit macros.
+
+JSON format: { "meal_name": "...", "ingredients": [{ "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }] }`;
+}
+
+function buildMacroBudgetBlock(budget, useUsda = false) {
   if (!budget) return '';
+  if (useUsda) {
+    return `MACRO TARGETS for this meal:
+- Calories: ~${budget.calories} kcal
+- Protein: ~${budget.protein}g
+- Carbs: ~${budget.carbs}g
+- Fat: ~${budget.fat}g
+
+${buildUsdaToolInstructions(budget)}\n`;
+  }
   return `MACRO TARGETS for this meal:
 - Calories: ~${budget.calories} kcal
 - Protein: ~${budget.protein}g
@@ -209,12 +242,13 @@ export function buildSingleMealPrompt({
   ragContext = null,
   reason = null,        // for regeneration: user's feedback
   currentMeal = null,   // for regeneration: meal being replaced
+  useUsda = false,
 }) {
   const lines = [
     `You are a sports nutritionist creating a ${mealType} for an athlete.`,
     '',
     buildMealTypeGuidance(mealType),
-    buildMacroBudgetBlock(macroBudget),
+    buildMacroBudgetBlock(macroBudget, useUsda),
     buildPreferencesBlock({ foodPreferences, dietaryRestrictions }),
     buildTrainingBlock({ todayTraining, tomorrowTraining }),
     buildVarietyBlock({ avoidIngredients, alreadyGeneratedToday, ragContext }),
@@ -257,6 +291,7 @@ export function buildDayPrompt({
   avoidIngredients = [],
   previousDayMealNames = [],
   ragContext = null,
+  useUsda = false,
 }) {
   const mealsToGenerate = Object.keys(mealBudgets);
   const numMeals = mealsToGenerate.length;
@@ -284,11 +319,15 @@ export function buildDayPrompt({
     budgetSummary,
     '',
     `Choose ingredient gram amounts that approximately hit each meal's targets.`,
-    `Use COOKED weights for carbs. Rough density guide:`,
-    `- 1g protein food ≈ 0.25g protein, 0.10g fat`,
-    `- 1g cooked carb food ≈ 0.23g carbs`,
-    `- 1g vegetable ≈ 0.06g carbs`,
-    `- 1g added fat ≈ 1.0g fat`,
+    ...(useUsda
+      ? [buildUsdaToolInstructions(Object.values(mealBudgets)[0])]
+      : [
+          `Use COOKED weights for carbs. Rough density guide:`,
+          `- 1g protein food ≈ 0.25g protein, 0.10g fat`,
+          `- 1g cooked carb food ≈ 0.23g carbs`,
+          `- 1g vegetable ≈ 0.06g carbs`,
+          `- 1g added fat ≈ 1.0g fat`,
+        ]),
     '',
     buildPreferencesBlock({ foodPreferences, dietaryRestrictions }),
     buildTrainingBlock({ todayTraining, tomorrowTraining }),
@@ -413,17 +452,34 @@ export function buildWeekPrompt({
  * Build a prompt for parsing a user-entered meal description into
  * structured ingredients with types and estimated grams.
  *
- * Used by: log-custom-meal flow
+ * Used by: Log Meal /api/estimate-macros (OpenAI extraction only — no macros).
  */
-export function buildParseMealPrompt({ mealDescription }) {
-  return `Parse this meal into structured ingredients with types and estimated gram portions.
+export function buildParseMealPrompt({ mealDescription, mealType } = {}) {
+  const slot = mealType ? `This is a ${mealType} the user already ate.\n` : '';
+  return `Parse the user's meal description into foods and estimated gram amounts.
 
-MEAL: "${mealDescription}"
+${slot}MEAL: "${mealDescription}"
 
-Estimate realistic serving sizes based on a standard adult portion.
-Use COOKED weights for grains, pasta, and potatoes.
+This is a consumption log. Estimate what they actually ate.
+Do NOT invent calories, protein, carbs, or fat.
+Do NOT adjust portions to hit a calorie or macro target.
+Do NOT design a healthier or on-budget version of the meal.
 
-${TYPE_DESCRIPTIONS}
+QUANTITIES:
+- If the user gives an amount, honor it and convert to grams.
+  Examples: "3 eggs", "120g chicken", "half a bagel", "2 tbsp peanut butter", "1 cup rice", "2 slices bacon".
+- If quantities are omitted, assume a typical adult serving of that food.
+  Examples: "2 eggs" ≈ 100g, "a bagel" ≈ 100g, "2 slices bacon" ≈ 16g cooked, "half an avocado" ≈ 50g edible.
+
+NAMES:
+Use USDA-searchable cooked, single-ingredient names (not mixed dishes).
+Examples: "eggs cooked", "plain bagel", "bacon cooked", "avocado", "chicken breast cooked", "white rice cooked".
+
+TYPES (use exactly these labels; closest reasonable category):
+- "protein": meat, fish, eggs, bacon, tofu, tempeh, legumes, yogurt, cottage cheese
+- "carb": rice, pasta, bread, bagel, potato, oats, tortillas (cooked weights)
+- "vegetable": broccoli, spinach, peppers, onions, tomatoes, salad greens
+- "fat": oils, butter, avocado, peanut butter, cheese sauces that are mostly fat
 
 ${SINGLE_MEAL_FORMAT}`;
 }

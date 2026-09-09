@@ -13,6 +13,11 @@ import { useTheme } from '../../../context/ThemeContext';
 import { apiClient } from '../../../../shared/services/api';
 import { fetchSavedMealsByType, incrementMealUsage } from '../../../../shared/lib/dataClient';
 import { macroColors } from '../../../../shared/lib/macroColors';
+import { formatMealString, parseMealMacros } from '../../../../shared/lib/rebalanceDayMacros';
+import {
+  scaleIngredientByGrams,
+  sumLoggedIngredientMacros,
+} from '../../../../shared/lib/loggedMealMacros';
 import { getDayMealToggles, getActiveMealTypes } from '../../../utils/mealHelpers';
 import { AestheticSheet, AestheticCard, AestheticSectionLabel } from '../../ui/AestheticSheet';
 import { NutritionCitation } from '../../ui/NutritionCitation';
@@ -42,9 +47,56 @@ const MEAL_LABELS_PLURAL = {
   dessert: 'desserts',
 };
 
+function roundLoggedMacros(macros) {
+  return {
+    calories: Math.round(Number(macros.calories)),
+    protein: Math.round(Number(macros.protein)),
+    carbs: Math.round(Number(macros.carbs)),
+    fat: Math.round(Number(macros.fat)),
+  };
+}
+
+function macrosAreValid(macros) {
+  if (!macros || typeof macros !== 'object') return false;
+  return ['calories', 'protein', 'carbs', 'fat'].every((key) => {
+    if (macros[key] == null || macros[key] === '') return false;
+    const n = Number(macros[key]);
+    return Number.isFinite(n) && n >= 0;
+  });
+}
+
+function macrosFromSavedMeal(savedMeal) {
+  if (!savedMeal) return null;
+  const structured = {
+    calories: savedMeal.calories,
+    protein: savedMeal.protein,
+    carbs: savedMeal.carbs,
+    fat: savedMeal.fat,
+  };
+  if (macrosAreValid(structured) && String(savedMeal.name || '').trim()) {
+    return {
+      name: String(savedMeal.name).trim(),
+      ...roundLoggedMacros(structured),
+    };
+  }
+  const parsed = parseMealMacros(savedMeal.full_description || savedMeal.name || '');
+  if (!macrosAreValid(parsed) || !parsed.name) return null;
+  return {
+    name: parsed.name,
+    ...roundLoggedMacros(parsed),
+  };
+}
+
+function applyEstimateResult(result, fallbackName) {
+  const mealName = String(result.meal_name || fallbackName || '').trim();
+  const ingredients = Array.isArray(result.ingredients) ? result.ingredients : [];
+  const macros = result.macros;
+  const macroSource = result.macro_source || (ingredients.length ? 'usda' : 'ml_estimate');
+  return { mealName, ingredients, macros, macroSource };
+}
+
 function formatMealWithMacros(desc, macros) {
-  const c = (n) => Math.round(Number(n) || 0);
-  return `${desc} (Cal: ${c(macros.calories)}, P: ${c(macros.protein)}g, C: ${c(macros.carbs)}g, F: ${c(macros.fat)}g)`;
+  return formatMealString(desc, macros);
 }
 
 const getStyles = (colors) =>
@@ -331,6 +383,60 @@ const getStyles = (colors) =>
       fontWeight: '600',
       lineHeight: 20,
     },
+    reviewCard: {
+      padding: 12,
+      backgroundColor: colors.successLight,
+      borderWidth: 1,
+      borderColor: colors.successBorder,
+      borderRadius: 14,
+      gap: 10,
+    },
+    reviewTitle: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: colors.success,
+    },
+    ingredientRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      paddingVertical: 6,
+    },
+    ingredientInfo: {
+      flex: 1,
+    },
+    ingredientName: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: colors.text,
+    },
+    ingredientMacros: {
+      fontSize: 11,
+      color: colors.textSecondary,
+      marginTop: 2,
+    },
+    gramInput: {
+      width: 64,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: 10,
+      paddingHorizontal: 8,
+      paddingVertical: 8,
+      fontSize: 14,
+      color: colors.text,
+      textAlign: 'center',
+      backgroundColor: colors.inputBackground,
+    },
+    gramUnit: {
+      fontSize: 12,
+      fontWeight: '600',
+      color: colors.textTertiary,
+    },
+    overrideHint: {
+      fontSize: 11,
+      color: colors.textTertiary,
+      lineHeight: 16,
+    },
   });
 
 export const LogMealModal = ({
@@ -342,6 +448,7 @@ export const LogMealModal = ({
   isGuest,
   userId,
   mealPlan,
+  weekStarting,
 }) => {
   const [mealDescription, setMealDescription] = useState('');
   const [selectedDay, setSelectedDay] = useState(defaultDay || 'monday');
@@ -357,7 +464,10 @@ export const LogMealModal = ({
     mealPlan?.[selectedDay]
   ).filter((mt) => mt !== 'snacks');
   const [isEstimating, setIsEstimating] = useState(false);
-  const [estimatedMacros, setEstimatedMacros] = useState(null);
+  const [estimate, setEstimate] = useState(null);
+  const [totalMacros, setTotalMacros] = useState(null);
+  const [hasManualMacroOverride, setHasManualMacroOverride] = useState(false);
+  const [gramDrafts, setGramDrafts] = useState({});
   const [logged, setLogged] = useState(false);
   const [savedMeals, setSavedMeals] = useState([]);
   const [loadingSavedMeals, setLoadingSavedMeals] = useState(false);
@@ -402,9 +512,16 @@ export const LogMealModal = ({
     load();
   }, [visible, userId, selectedMealType, defaultMealType, isGuest]);
 
+  const clearEstimate = () => {
+    setEstimate(null);
+    setTotalMacros(null);
+    setHasManualMacroOverride(false);
+    setGramDrafts({});
+  };
+
   const setMode = (mode) => {
     setMacroMode(mode);
-    setEstimatedMacros(null);
+    clearEstimate();
     if (mode === 'auto') {
       setManualCalories('');
       setManualProtein('');
@@ -417,7 +534,7 @@ export const LogMealModal = ({
     if (!mealDescription.trim()) return;
 
     setIsEstimating(true);
-    setEstimatedMacros(null);
+    clearEstimate();
 
     try {
       const result = await apiClient.estimateMacros({
@@ -425,10 +542,16 @@ export const LogMealModal = ({
         mealType: selectedMealType,
       });
 
-      if (result.success && result.macros) {
-        setEstimatedMacros(result.macros);
+      if (result.success && macrosAreValid(result.macros)) {
+        const next = applyEstimateResult(result, mealDescription.trim());
+        setEstimate(next);
+        setTotalMacros(next.macros);
+        setHasManualMacroOverride(false);
       } else {
-        Alert.alert('Estimate failed', result.error || "Couldn't estimate macros. Try again or enter them manually.");
+        Alert.alert(
+          'Estimate failed',
+          result.error || "Couldn't estimate macros. Try again or enter them manually."
+        );
       }
     } catch (error) {
       console.error('Failed to estimate macros:', error);
@@ -458,57 +581,172 @@ export const LogMealModal = ({
     return macros;
   };
 
-  const finishLog = (finalMeal) => {
-    onLog(selectedDay, selectedMealType, finalMeal);
+  const persistLoggedMeal = async ({ mealName, macros, macroSource, ingredients = [] }) => {
+    if (isGuest) return;
+    if (!weekStarting) {
+      throw new Error('Missing week starting date. Please close and try again.');
+    }
+    const result = await apiClient.logMeal({
+      day: selectedDay,
+      mealType: selectedMealType,
+      weekStarting,
+      mealName,
+      calories: macros.calories,
+      protein: macros.protein,
+      carbs: macros.carbs,
+      fat: macros.fat,
+      macroSource,
+      ingredients,
+    });
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to log meal');
+    }
+  };
+
+  const finishLog = (finalMeal, structuredMeal) => {
+    onLog(selectedDay, selectedMealType, finalMeal, structuredMeal);
     setLogged(true);
     setTimeout(() => {
       handleClose();
     }, 1000);
   };
 
+  const handleGramCommit = (index, rawValue) => {
+    if (!estimate?.ingredients?.[index]) return;
+    const grams = Number(rawValue);
+    if (!Number.isFinite(grams) || grams < 0) return;
+    const ingredients = estimate.ingredients.map((ing, i) =>
+      i === index ? scaleIngredientByGrams(ing, grams) : ing
+    );
+    const macros = sumLoggedIngredientMacros(ingredients);
+    setEstimate({ ...estimate, ingredients, macros });
+    setTotalMacros(macros);
+    setHasManualMacroOverride(false);
+    setGramDrafts((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+  };
+
+  const handleTotalChange = (key, rawValue) => {
+    setHasManualMacroOverride(true);
+    const n = Number(rawValue);
+    setTotalMacros((prev) => ({
+      ...(prev || estimate?.macros || { calories: 0, protein: 0, carbs: 0, fat: 0 }),
+      [key]: rawValue === '' || !Number.isFinite(n) ? rawValue : n,
+    }));
+  };
+
   const handleLog = async () => {
-    if (!mealDescription.trim()) return;
+    if (!mealDescription.trim() || logged || isEstimating) return;
 
     const desc = mealDescription.trim();
-
-    if (macroMode === 'manual') {
-      const macros = parseManualMacros();
-      if (!macros) return;
-      finishLog(formatMealWithMacros(desc, macros));
-      return;
-    }
-
-    // Auto: reuse preview if available, otherwise estimate now
-    if (estimatedMacros) {
-      finishLog(formatMealWithMacros(desc, estimatedMacros));
-      return;
-    }
-
     setIsEstimating(true);
     setLogged(false);
 
     try {
-      const result = await apiClient.estimateMacros({
-        meal: desc,
-        mealType: selectedMealType,
-      });
+      if (macroMode === 'manual') {
+        const macros = parseManualMacros();
+        if (!macros) return;
+        const mealString = formatMealWithMacros(desc, macros);
+        await persistLoggedMeal({
+          mealName: desc,
+          macros,
+          macroSource: 'user_entered',
+          ingredients: [],
+        });
+        finishLog(mealString, {
+          meal_name: desc,
+          macros,
+          macro_source: 'user_entered',
+          provider: 'user_logged',
+          ingredients: [],
+        });
+        return;
+      }
 
-      const finalMeal = result.success && result.meal ? result.meal : desc;
-      finishLog(finalMeal);
+      let current = estimate;
+      let macros = totalMacros;
+      if (!current || !macrosAreValid(macros || current.macros)) {
+        const result = await apiClient.estimateMacros({
+          meal: desc,
+          mealType: selectedMealType,
+        });
+        if (!result.success || !macrosAreValid(result.macros)) {
+          if (isGuest) {
+            finishLog(desc);
+            return;
+          }
+          throw new Error(
+            result.error || "Couldn't estimate macros. Try again or enter them manually."
+          );
+        }
+        current = applyEstimateResult(result, desc);
+        setEstimate(current);
+        setTotalMacros(current.macros);
+        setHasManualMacroOverride(false);
+        return;
+      }
+
+      macros = {
+        calories: Number(totalMacros.calories),
+        protein: Number(totalMacros.protein),
+        carbs: Number(totalMacros.carbs),
+        fat: Number(totalMacros.fat),
+      };
+      if (!macrosAreValid(macros)) {
+        throw new Error('Enter valid calories, protein, carbs, and fat.');
+      }
+
+      const ingredients = Array.isArray(current.ingredients) ? current.ingredients : [];
+      const macroSource = hasManualMacroOverride
+        ? 'user_entered'
+        : current.macroSource || (ingredients.length ? 'usda' : 'ml_estimate');
+      const mealName = (current.mealName || desc).trim();
+      const mealString = formatMealWithMacros(mealName, macros);
+      await persistLoggedMeal({ mealName, macros, macroSource, ingredients });
+      finishLog(mealString, {
+        meal_name: mealName,
+        macros,
+        macro_source: macroSource,
+        provider: 'user_logged',
+        ingredients,
+      });
     } catch (error) {
       console.error('Failed to log meal:', error);
-      finishLog(desc);
+      if (isGuest) {
+        finishLog(desc);
+        return;
+      }
+      Alert.alert('Could not log meal', error.message || 'Failed to log meal');
     } finally {
       setIsEstimating(false);
     }
   };
 
   const handleLogSavedMeal = async (savedMeal) => {
-    if (!savedMeal?.full_description) return;
-
     setLoggingSavedMeal(savedMeal.id);
     try {
-      onLog(selectedDay, selectedMealType, savedMeal.full_description);
+      const parsed = macrosFromSavedMeal(savedMeal);
+      if (!parsed?.name) {
+        throw new Error('This saved meal is missing macros and cannot be logged.');
+      }
+      const macros = roundLoggedMacros(parsed);
+      const mealString = formatMealWithMacros(parsed.name, macros);
+      await persistLoggedMeal({
+        mealName: parsed.name,
+        macros,
+        macroSource: 'user_entered',
+        ingredients: [],
+      });
+      onLog(selectedDay, selectedMealType, mealString, {
+        meal_name: parsed.name,
+        macros,
+        macro_source: 'user_entered',
+        provider: 'user_logged',
+        ingredients: [],
+      });
       await incrementMealUsage(savedMeal.id);
       Alert.alert('Success', 'Meal logged!');
       handleClose();
@@ -523,7 +761,7 @@ export const LogMealModal = ({
   const handleClose = () => {
     setMealDescription('');
     setLogged(false);
-    setEstimatedMacros(null);
+    clearEstimate();
     setMacroMode('auto');
     setManualCalories('');
     setManualProtein('');
@@ -586,7 +824,7 @@ export const LogMealModal = ({
               key={type}
               onPress={() => {
                 setSelectedMealType(type);
-                setEstimatedMacros(null);
+                clearEstimate();
               }}
               style={[
                 styles.mealTypeButton,
@@ -614,7 +852,7 @@ export const LogMealModal = ({
           value={mealDescription}
           onChangeText={(text) => {
             setMealDescription(text);
-            setEstimatedMacros(null);
+            clearEstimate();
           }}
           placeholder="e.g., Grilled chicken salad with olive oil dressing, side of brown rice..."
           placeholderTextColor={colors.textTertiary}
@@ -648,7 +886,7 @@ export const LogMealModal = ({
             >
               Estimate for me
             </Text>
-            <Text style={styles.modeButtonHint}>AI fills calories & macros</Text>
+            <Text style={styles.modeButtonHint}>AI estimates ingredients</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.modeButton, macroMode === 'manual' && styles.modeButtonSelected]}
@@ -693,7 +931,7 @@ export const LogMealModal = ({
         </AestheticCard>
       ) : (
         <>
-          {mealDescription.trim() && !estimatedMacros && (
+          {mealDescription.trim() && !estimate && (
             <TouchableOpacity
               onPress={handleEstimateMacros}
               disabled={isEstimating}
@@ -702,38 +940,87 @@ export const LogMealModal = ({
               {isEstimating ? (
                 <>
                   <ActivityIndicator size="small" color={colors.textSecondary} />
-                  <Text style={styles.estimateButtonText}>Estimating...</Text>
+                  <Text style={styles.estimateButtonText}>Estimating ingredients...</Text>
                 </>
               ) : (
-                <Text style={styles.estimateButtonText}>Preview Macro Estimate</Text>
+                <Text style={styles.estimateButtonText}>Estimate ingredients</Text>
               )}
             </TouchableOpacity>
           )}
 
-          {estimatedMacros && (
-            <View style={styles.macrosContainer}>
-              <Text style={styles.macrosTitle}>Estimated Macros:</Text>
-              <View style={styles.macrosGrid}>
-                <View style={[styles.macroChip, styles.macroChipCalories]}>
-                  <Text style={styles.macroChipLabel}>Cal</Text>
-                  <Text style={styles.macroChipValue}>{estimatedMacros.calories}</Text>
+          {estimate && totalMacros && (
+            <View style={styles.reviewCard}>
+              <Text style={styles.reviewTitle}>Estimated meal</Text>
+              <TextInput
+                value={estimate.mealName}
+                onChangeText={(text) => setEstimate({ ...estimate, mealName: text })}
+                style={styles.macroInput}
+              />
+
+              {estimate.ingredients.length > 0 && (
+                <View>
+                  <AestheticSectionLabel>Ingredients</AestheticSectionLabel>
+                  {estimate.ingredients.map((ing, index) => (
+                    <View key={`${ing.name}-${index}`} style={styles.ingredientRow}>
+                      <View style={styles.ingredientInfo}>
+                        <Text style={styles.ingredientName} numberOfLines={1}>
+                          {ing.name}
+                        </Text>
+                        <Text style={styles.ingredientMacros} numberOfLines={1}>
+                          {ing.calories} cal · {ing.protein}P {ing.carbs}C {ing.fat}F
+                        </Text>
+                      </View>
+                      <TextInput
+                        style={styles.gramInput}
+                        keyboardType="numeric"
+                        value={
+                          gramDrafts[index] != null ? String(gramDrafts[index]) : String(ing.grams)
+                        }
+                        onChangeText={(text) =>
+                          setGramDrafts((prev) => ({ ...prev, [index]: text }))
+                        }
+                        onEndEditing={(e) => handleGramCommit(index, e.nativeEvent.text)}
+                        placeholderTextColor={colors.textTertiary}
+                      />
+                      <Text style={styles.gramUnit}>g</Text>
+                    </View>
+                  ))}
                 </View>
-                <View style={[styles.macroChip, styles.macroChipProtein]}>
-                  <Text style={styles.macroChipLabel}>P</Text>
-                  <Text style={styles.macroChipValue}>{estimatedMacros.protein}g</Text>
-                </View>
-                <View style={[styles.macroChip, styles.macroChipCarbs]}>
-                  <Text style={styles.macroChipLabel}>C</Text>
-                  <Text style={styles.macroChipValue}>{estimatedMacros.carbs}g</Text>
-                </View>
-                <View style={[styles.macroChip, styles.macroChipFat]}>
-                  <Text style={styles.macroChipLabel}>F</Text>
-                  <Text style={styles.macroChipValue}>{estimatedMacros.fat}g</Text>
-                </View>
+              )}
+
+              <AestheticSectionLabel>
+                {hasManualMacroOverride ? 'Totals (manual override)' : 'Totals'}
+              </AestheticSectionLabel>
+              <View style={styles.macroRow}>
+                {[
+                  { key: 'calories', label: 'Cal' },
+                  { key: 'protein', label: 'P' },
+                  { key: 'carbs', label: 'C' },
+                  { key: 'fat', label: 'F' },
+                ].map((field) => (
+                  <View key={field.key} style={styles.macroField}>
+                    <Text style={styles.macroLabel}>{field.label}</Text>
+                    <TextInput
+                      style={styles.macroInput}
+                      value={String(totalMacros[field.key] ?? '')}
+                      onChangeText={(text) => handleTotalChange(field.key, text)}
+                      keyboardType="numeric"
+                      placeholderTextColor={colors.textTertiary}
+                    />
+                  </View>
+                ))}
               </View>
+              <Text style={styles.overrideHint}>
+                {estimate.macroSource === 'ml_estimate'
+                  ? 'Fallback total estimate — no ingredient breakdown.'
+                  : hasManualMacroOverride
+                    ? 'Totals are a manual override. Changing grams restores USDA totals.'
+                    : 'Totals are the sum of the ingredients. Edit grams or override totals.'}
+              </Text>
               <NutritionCitation>
-                These estimates come from our meal-type machine learning models, which predict
-                calories and macros from your description. They are approximations.
+                {estimate.macroSource === 'ml_estimate'
+                  ? 'These totals come from a fallback estimator because ingredient matching was unavailable.'
+                  : 'Ingredient nutrition is calculated from USDA FoodData Central at the estimated amounts. This is a log of what you ate, not a target-adjusted meal.'}
               </NutritionCitation>
             </View>
           )}
@@ -758,12 +1045,14 @@ export const LogMealModal = ({
         ) : isEstimating ? (
           <>
             <ActivityIndicator size="small" color="#FFFFFF" />
-            <Text style={styles.logButtonText}>Estimating macros...</Text>
+            <Text style={styles.logButtonText}>Logging...</Text>
           </>
         ) : (
           <>
             <Ionicons name="restaurant" size={20} color="#FFFFFF" />
-            <Text style={styles.logButtonText}>Log Meal</Text>
+            <Text style={styles.logButtonText}>
+              {macroMode === 'auto' && !estimate ? 'Estimate & review' : 'Log Meal'}
+            </Text>
           </>
         )}
       </TouchableOpacity>

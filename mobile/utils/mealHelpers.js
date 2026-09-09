@@ -1,5 +1,8 @@
 // Helper functions for meal plan functionality
 
+import { parseMealString } from '../../shared/lib/parseMealString';
+import { getMealSlotDisplay } from '../../shared/lib/mealSlotState';
+
 export const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 export const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 export const MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snacks', 'dessert'];
@@ -99,35 +102,7 @@ export const addDaysToLocalDate = (localDate, days) => {
   return `${y}-${m}-${day}`;
 };
 
-export const parseMeal = (mealString) => {
-  if (!mealString || typeof mealString !== 'string') {
-    return { name: '', calories: 0, protein: 0, carbs: 0, fat: 0 };
-  }
-
-  const calMatch = mealString.match(/Cal:\s*(\d+)/);
-  const proteinMatch = mealString.match(/P:\s*(\d+)g/);
-  const carbsMatch = mealString.match(/C:\s*(\d+)g/);
-  const fatMatch = mealString.match(/F:\s*(\d+)g/);
-
-  // Match at `(` so trailing spaces in the name are not consumed (typing fix).
-  const macroSuffixMatch = mealString.match(
-    /\(\s*Cal:\s*\d+\s*,\s*P:\s*\d+g\s*,\s*C:\s*\d+g\s*,\s*F:\s*\d+g\s*\)\s*$/i
-  );
-  let name = mealString;
-  if (macroSuffixMatch) {
-    name = mealString.slice(0, macroSuffixMatch.index);
-    // Drop the single spacer written by formatMealWithMacros before `(`.
-    if (name.endsWith(' ')) name = name.slice(0, -1);
-  }
-
-  return {
-    name,
-    calories: calMatch ? parseInt(calMatch[1], 10) : 0,
-    protein: proteinMatch ? parseInt(proteinMatch[1], 10) : 0,
-    carbs: carbsMatch ? parseInt(carbsMatch[1], 10) : 0,
-    fat: fatMatch ? parseInt(fatMatch[1], 10) : 0,
-  };
-};
+export const parseMeal = parseMealString;
 
 export const calculateDayMacros = (dayMeals) => {
   const total = { calories: 0, protein: 0, carbs: 0, fat: 0 };
@@ -137,7 +112,10 @@ export const calculateDayMacros = (dayMeals) => {
   activeTypes.forEach((mealType) => {
     const meal = dayMeals?.[mealType];
     if (meal) {
-      const parsed = parseMeal(meal);
+      const parsed = getMealSlotDisplay({
+        meal,
+        mealV2: dayMeals?.[`${mealType}_v2`],
+      });
       total.calories += parsed.calories;
       total.protein += parsed.protein;
       total.carbs += parsed.carbs;

@@ -18,6 +18,14 @@ import {
   parseMealMacros,
 } from '../../shared/lib/rebalanceDayMacros.js';
 import { recordUserStreak } from '../lib/recordStreak.js';
+import {
+  dateFromWeekStartingAndDay,
+  deleteMeal,
+  getMealsForDay,
+  saveMeal,
+} from '../lib/mealStore.js';
+import { upsertDaySettings } from '../lib/daySettingsStore.js';
+import { mergeNormalizedMealsIntoLegacyWeek } from '../../shared/lib/mergeNormalizedMeals.js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -149,6 +157,86 @@ async function loadDailyMacros(userId, localDate) {
   return nutrition.dailyMacros;
 }
 
+const REBALANCE_TYPES = ['breakfast', 'lunch', 'dinner', 'dessert'];
+
+function logNormalizedFailure(label, err) {
+  console.warn(
+    `[log-snack] ${label} failed; continuing with legacy meal_plans JSONB:`,
+    err?.message || err
+  );
+}
+
+async function tryNormalized(label, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    logNormalizedFailure(label, err);
+    return null;
+  }
+}
+
+function daySettingsFromDay(dayMeals) {
+  return {
+    include_dessert: dayMeals?.include_dessert !== false,
+    original_targets: dayMeals?.original_targets || null,
+    over_budget: Boolean(dayMeals?.over_budget),
+    adjusted_meal_types: Array.isArray(dayMeals?.adjusted_meal_types)
+      ? dayMeals.adjusted_meal_types
+      : [],
+    targets_adjusted: Boolean(dayMeals?.targets_adjusted),
+  };
+}
+
+async function overlayNormalizedDay({ userId, weekStarting, day, dayMeals }) {
+  const date = dateFromWeekStartingAndDay(weekStarting, day);
+  const normalizedMeals = await getMealsForDay({ userId, date });
+  const { week } = mergeNormalizedMealsIntoLegacyWeek({
+    legacyWeek: { [day]: dayMeals },
+    normalizedMeals,
+    weekStarting,
+  });
+  return { date, dayMeals: week[day] || dayMeals, normalizedMeals };
+}
+
+async function persistNormalizedSlot({ userId, date, mealType, dayMeals, existing }) {
+  const v2 = dayMeals?.[`${mealType}_v2`];
+  const parsed = parseMealMacros(dayMeals?.[mealType] || '');
+  if (!parsed.name && !v2?.meal_name) return;
+
+  const ingredients = Array.isArray(v2?.ingredients)
+    ? v2.ingredients
+    : existing?.ingredients || [];
+  const macroSource = v2?.macro_source || existing?.macro_source || 'user_entered';
+  const structuredSources = new Set(['usda', 'usda_partial', 'type_density']);
+  if (structuredSources.has(macroSource) && ingredients.length > 0 && !v2?.macros) {
+    // String-only rebalance must not overwrite USDA totals without scaled ingredients.
+    return;
+  }
+  const macros = v2?.macros || {
+    calories: parsed.calories,
+    protein: parsed.protein,
+    carbs: parsed.carbs,
+    fat: parsed.fat,
+  };
+
+  await saveMeal({
+    userId,
+    date,
+    mealType,
+    slotIndex: 0,
+    mealName: v2?.meal_name || parsed.name,
+    calories: macros.calories,
+    protein: macros.protein,
+    carbs: macros.carbs,
+    fat: macros.fat,
+    macroSource,
+    provider: v2?.provider || existing?.provider || 'openai',
+    isUserLogged: Boolean(existing?.is_user_logged),
+    rating: existing?.rating ?? null,
+    ingredients,
+  });
+}
+
 async function loadCompletedMealTypes(userId, localDate, day) {
   const { data, error } = await supabase
     .from('meal_completions')
@@ -192,12 +280,57 @@ export default async function handler(req, res) {
 
     const existing = await loadWeekMeals(userId, weekStarting);
     const weekMeals = { ...(existing?.meals || {}) };
-    const dayMeals = { ...(weekMeals[day] || {}) };
+    let dayMeals = { ...(weekMeals[day] || {}) };
+
+    const overlay = await tryNormalized('overlay', () =>
+      overlayNormalizedDay({
+        userId,
+        weekStarting,
+        day,
+        dayMeals,
+      })
+    );
+    const date = overlay?.date || dateFromWeekStartingAndDay(weekStarting, day);
+    if (overlay?.dayMeals) dayMeals = overlay.dayMeals;
+    const normalizedByType = Object.fromEntries(
+      (overlay?.normalizedMeals || []).map((row) => [String(row.meal_type).toLowerCase(), row])
+    );
 
     // ── DELETE: clear snack + restore ────────────────────────────────────────
     if (req.method === 'DELETE') {
       const restored = restoreDayFromOriginalTargets(dayMeals);
       weekMeals[day] = restored;
+
+      await tryNormalized('delete snacks row', () =>
+        deleteMeal({
+          userId,
+          date,
+          mealType: 'snacks',
+          slotIndex: 0,
+        })
+      );
+
+      for (const mt of REBALANCE_TYPES) {
+        if (!restored[mt] || typeof restored[mt] !== 'string' || !restored[mt].trim()) continue;
+        if (!normalizedByType[mt] && !restored[`${mt}_v2`]) continue;
+        await tryNormalized(`restore ${mt}`, () =>
+          persistNormalizedSlot({
+            userId,
+            date,
+            mealType: mt,
+            dayMeals: restored,
+            existing: normalizedByType[mt],
+          })
+        );
+      }
+
+      await tryNormalized('upsert day_settings on delete', () =>
+        upsertDaySettings({
+          userId,
+          date,
+          ...daySettingsFromDay(restored),
+        })
+      );
       await saveWeekMeals(userId, weekStarting, weekMeals, existing?.id);
 
       return res.status(200).json({
@@ -227,10 +360,19 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: validated.error });
     }
     const macros = validated.macros;
+    const snackIngredients = Array.isArray(body.ingredients) ? body.ingredients : [];
+    const snackMacroSource = String(body.macroSource || 'user_entered').trim() || 'user_entered';
 
     const snackString = formatMealString(name, macros);
     dayMeals.snacks = snackString;
     dayMeals.snacks_user_logged = true;
+    dayMeals.snacks_v2 = {
+      meal_name: name,
+      macros,
+      macro_source: snackMacroSource,
+      provider: 'user_logged',
+      ingredients: snackIngredients,
+    };
 
     const shouldRebalance = isTodaySnackDay({ day, weekStarting, localDate });
     let overBudget = false;
@@ -256,6 +398,46 @@ export default async function handler(req, res) {
       adjustedMealTypes = result.adjusted_meal_types;
       rebalanced = true;
     }
+
+    await tryNormalized('save snacks row', () =>
+      saveMeal({
+        userId,
+        date,
+        mealType: 'snacks',
+        slotIndex: 0,
+        mealName: name,
+        calories: macros.calories,
+        protein: macros.protein,
+        carbs: macros.carbs,
+        fat: macros.fat,
+        macroSource: snackMacroSource,
+        provider: 'user_logged',
+        isUserLogged: true,
+        rating: null,
+        ingredients: snackIngredients,
+      })
+    );
+
+    for (const mt of adjustedMealTypes) {
+      if (!normalizedByType[mt] && !resultDay[`${mt}_v2`]) continue;
+      await tryNormalized(`rebalance ${mt}`, () =>
+        persistNormalizedSlot({
+          userId,
+          date,
+          mealType: mt,
+          dayMeals: resultDay,
+          existing: normalizedByType[mt],
+        })
+      );
+    }
+
+    await tryNormalized('upsert day_settings on log', () =>
+      upsertDaySettings({
+        userId,
+        date,
+        ...daySettingsFromDay(resultDay),
+      })
+    );
 
     weekMeals[day] = resultDay;
     await saveWeekMeals(userId, weekStarting, weekMeals, existing?.id);

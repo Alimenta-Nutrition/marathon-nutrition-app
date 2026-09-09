@@ -12,7 +12,6 @@ import {
 } from 'react-native';
 import { useTheme } from '../../../context/ThemeContext';
 import { AestheticDialog } from '../../ui/AestheticSheet';
-import { formatMealString } from '../../../../shared/lib/rebalanceDayMacros';
 
 /**
  * Edit a logged meal's name and macros. Parent calls updateMeal with the result.
@@ -36,7 +35,7 @@ export const EditMealModal = ({ visible, onClose, onSave, initialMeal }) => {
     setFat(initialMeal?.fat != null ? String(initialMeal.fat) : '');
   }, [visible, initialMeal]);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const trimmed = name.trim();
     if (!trimmed) {
       Alert.alert('Name required', 'Enter a meal name.');
@@ -61,7 +60,7 @@ export const EditMealModal = ({ visible, onClose, onSave, initialMeal }) => {
         return;
       }
     }
-    onSave(formatMealString(trimmed, macros));
+    await onSave({ name: trimmed, macros });
   };
 
   const footer = (

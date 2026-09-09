@@ -5,11 +5,13 @@
 import { createClient } from '@supabase/supabase-js';
 import { computeNutritionTargets, withNumericIntensities, deriveWorkoutTiming } from '../../shared/lib/tdeeCalc.js';
 import { estimateAndAdjust } from '../../shared/lib/macroEstimator.js';
+import { buildUsdaToolInstructions } from '../../shared/lib/mealPromptBuilder.js';
 import { validateIngredients } from '../../shared/lib/validateIngredients.js';
-import { completeJSON, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
+import { completeJSON, completeMealWithUsda, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
 import { parseAIJson } from '../lib/parseAIJson.js';
 import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
+import { computeUsdaMacros, normalizeIngredientList } from '../lib/usdaMacros.js';
 import { recordUserStreak } from '../lib/recordStreak.js';
 
 const supabase = createClient(
@@ -24,7 +26,33 @@ const AI_CONFIG = {
   openai: { openaiModel: OPENAI_MEAL_MODEL, temperature: 0.8, maxTokens: 3000 },
 };
 
-function buildMealPrepPrompt(rawMealType, avgBudget, numServings, dietaryRestrictions, likes, cuisines, dislikes) {
+function roundMacrosInt(macros) {
+  return {
+    calories: Math.round(macros.calories),
+    protein: Math.round(macros.protein),
+    carbs: Math.round(macros.carbs),
+    fat: Math.round(macros.fat),
+  };
+}
+
+function buildMealPrepPrompt(
+  rawMealType,
+  avgBudget,
+  numServings,
+  dietaryRestrictions,
+  likes,
+  cuisines,
+  dislikes,
+  useUsda = false
+) {
+  const densityOrTool = useUsda
+    ? buildUsdaToolInstructions(avgBudget)
+    : `Density guide (to size portions):
+- 1g protein food ≈ 0.25g protein, 0.10g fat
+- 1g cooked carb food ≈ 0.23g carbs
+- 1g vegetable ≈ 0.06g carbs
+- 1g added fat (oil/butter) ≈ 1.0g fat`;
+
   return `You are a sports nutritionist creating meal prep options for an athlete.
 
 TASK: Create exactly 4 different ${rawMealType} meal prep recipes, each making ${numServings} servings.
@@ -35,11 +63,7 @@ PER-SERVING MACRO TARGETS:
 - Carbs: ~${avgBudget.carbs}g
 - Fat: ~${avgBudget.fat}g
 
-Density guide (to size portions):
-- 1g protein food ≈ 0.25g protein, 0.10g fat
-- 1g cooked carb food ≈ 0.23g carbs
-- 1g vegetable ≈ 0.06g carbs
-- 1g added fat (oil/butter) ≈ 1.0g fat
+${densityOrTool}
 
 ${dietaryRestrictions ? `DIETARY RESTRICTIONS (MUST follow): ${dietaryRestrictions}` : ''}
 ${likes ? `FOODS/CUISINES THE USER ENJOYS (rotate through these): ${likes}${cuisines ? ', ' + cuisines : ''}` : ''}
@@ -68,6 +92,54 @@ Respond with ONLY valid JSON:
     }
   ]
 }`;
+}
+
+function emptyPrepOption(opt) {
+  return {
+    name: opt.meal_name || 'Unknown',
+    description: opt.description || '',
+    prepReason: opt.prep_reason || '',
+    prepTime: opt.prep_time || '',
+    macros: null,
+    fullDescription: `${opt.meal_name || 'Meal prep option'}`,
+    ingredients: [],
+  };
+}
+
+function mapPrepOptionFromEstimate(opt, avgBudget, numServings, dislikes, dietaryRestrictions) {
+  const ingredients = validateIngredients(
+    normalizeIngredientList(opt.ingredients),
+    dislikes,
+    dietaryRestrictions
+  );
+
+  if (ingredients.length === 0) {
+    return emptyPrepOption(opt);
+  }
+
+  const result = estimateAndAdjust(ingredients, avgBudget);
+  const macros = roundMacrosInt(result.macros);
+  const mealName = opt.meal_name || 'Meal prep option';
+  const fullDescription = `${mealName} (Cal: ${macros.calories}, P: ${macros.protein}g, C: ${macros.carbs}g, F: ${macros.fat}g)`;
+
+  return {
+    name: mealName,
+    description: opt.description || '',
+    prepReason: opt.prep_reason || '',
+    prepTime: opt.prep_time || '',
+    macros,
+    fullDescription,
+    ingredients: result.ingredients,
+    perServingBudget: avgBudget,
+    totalForPrep: {
+      servings: numServings,
+      totalCalories: macros.calories * numServings,
+      totalProtein: macros.protein * numServings,
+      totalCarbs: macros.carbs * numServings,
+      totalFat: macros.fat * numServings,
+    },
+    scaled: result.scaled,
+  };
 }
 
 export function createGenerateMealPrepHandler(provider) {
@@ -146,83 +218,139 @@ export function createGenerateMealPrepHandler(provider) {
       const likes = foodPreferences?.likes || '';
       const cuisines = foodPreferences?.cuisine_favorites || foodPreferences?.cuisines || '';
 
-      const prompt = buildMealPrepPrompt(
+      const promptParts = [
         rawMealType,
         avgBudget,
         numServings,
         dietaryRestrictions,
         likes,
         cuisines,
-        dislikes
-      );
+        dislikes,
+      ];
 
       console.log(`🥘 Generating ${rawMealType} meal prep (${provider}, ${numServings} servings)...`);
 
-      const rawText = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
+      const mapOptionsFromEstimate = (rawOptions) =>
+        rawOptions.map((opt) =>
+          mapPrepOptionFromEstimate(opt, avgBudget, numServings, dislikes, dietaryRestrictions)
+        );
 
-      let data;
-      try {
-        data = parseAIJson(rawText);
-      } catch (parseError) {
-        console.error(`Failed to parse ${provider} response. Raw text:`, rawText);
-        throw parseError;
-      }
+      let options;
 
-      const rawOptions = data.options || [];
+      if (provider === 'openai') {
+        const usdaStarted = Date.now();
+        try {
+          const prompt = buildMealPrepPrompt(...promptParts, true);
+          const { parsed, toolRounds, usdaResults } = await completeMealWithUsda({
+            prompt,
+            reasoningEffort: 'none',
+          });
 
-      const options = rawOptions.map((opt) => {
-        let ingredients = (opt.ingredients || [])
-          .filter((ing) => ing.name && ing.type && ing.grams > 0)
-          .map((ing) => ({
-            name: String(ing.name).trim(),
-            type: String(ing.type).trim().toLowerCase(),
-            grams: Math.round(parseFloat(ing.grams) || 0),
-          }));
+          const rawOptions = parsed.options || [];
+          if (!rawOptions.length) {
+            throw new Error('USDA meal-prep response had no options');
+          }
 
-        ingredients = validateIngredients(ingredients, dislikes, dietaryRestrictions);
+          options = rawOptions.map((opt) => {
+            const ingredients = validateIngredients(
+              normalizeIngredientList(opt.ingredients),
+              dislikes,
+              dietaryRestrictions
+            );
 
-        if (ingredients.length === 0) {
-          return {
-            name: opt.meal_name || 'Unknown',
-            description: opt.description || '',
-            prepReason: opt.prep_reason || '',
-            prepTime: opt.prep_time || '',
-            macros: null,
-            fullDescription: `${opt.meal_name || 'Meal prep option'}`,
-            ingredients: [],
-          };
+            if (ingredients.length === 0) {
+              return emptyPrepOption(opt);
+            }
+
+            const {
+              macros,
+              ingredients: v2Ingredients,
+              macro_source,
+              scaled,
+              scaleFactors,
+            } = computeUsdaMacros(ingredients, usdaResults, avgBudget);
+
+            const mealName = opt.meal_name || 'Meal prep option';
+            const fullDescription = `${mealName} (Cal: ${macros.calories}, P: ${macros.protein}g, C: ${macros.carbs}g, F: ${macros.fat}g)`;
+
+            return {
+              name: mealName,
+              description: opt.description || '',
+              prepReason: opt.prep_reason || '',
+              prepTime: opt.prep_time || '',
+              macros,
+              fullDescription,
+              ingredients: v2Ingredients,
+              perServingBudget: avgBudget,
+              totalForPrep: {
+                servings: numServings,
+                totalCalories: macros.calories * numServings,
+                totalProtein: macros.protein * numServings,
+                totalCarbs: macros.carbs * numServings,
+                totalFat: macros.fat * numServings,
+              },
+              scaled,
+              meal_v2: {
+                meal_name: mealName,
+                macros,
+                macro_source,
+                ingredients: v2Ingredients,
+                budget: avgBudget,
+                scaled,
+                scaleFactors: scaled ? scaleFactors : null,
+                tool_rounds: toolRounds,
+                provider: 'openai',
+              },
+            };
+          });
+
+          console.log(
+            `[generate-meal-prep] openai USDA options=${options.length} ` +
+              `tool_rounds=${toolRounds} latency_ms=${Date.now() - usdaStarted}`
+          );
+        } catch (usdaErr) {
+          console.error(
+            `USDA meal-prep failed, falling back to completeJSON: ${usdaErr?.message || usdaErr}`
+          );
+          const prompt = buildMealPrepPrompt(...promptParts, false);
+          const rawText = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
+          let data;
+          try {
+            data = parseAIJson(rawText);
+          } catch (parseError) {
+            console.error(`Failed to parse ${provider} response. Raw text:`, rawText);
+            throw parseError;
+          }
+          options = mapOptionsFromEstimate(data.options || []).map((opt) =>
+            opt.macros
+              ? {
+                  ...opt,
+                  meal_v2: {
+                    meal_name: opt.name,
+                    ingredients: opt.ingredients,
+                    macros: opt.macros,
+                    budget: avgBudget,
+                    scaled: opt.scaled,
+                    scaleFactors: null,
+                    macro_source: 'type_density',
+                    provider: 'openai',
+                  },
+                }
+              : opt
+          );
         }
-
-        const result = estimateAndAdjust(ingredients, avgBudget);
-        const macros = {
-          calories: Math.round(result.macros.calories),
-          protein: Math.round(result.macros.protein),
-          carbs: Math.round(result.macros.carbs),
-          fat: Math.round(result.macros.fat),
-        };
-
-        const mealName = opt.meal_name || 'Meal prep option';
-        const fullDescription = `${mealName} (Cal: ${macros.calories}, P: ${macros.protein}g, C: ${macros.carbs}g, F: ${macros.fat}g)`;
-
-        return {
-          name: mealName,
-          description: opt.description || '',
-          prepReason: opt.prep_reason || '',
-          prepTime: opt.prep_time || '',
-          macros,
-          fullDescription,
-          ingredients: result.ingredients,
-          perServingBudget: avgBudget,
-          totalForPrep: {
-            servings: numServings,
-            totalCalories: macros.calories * numServings,
-            totalProtein: macros.protein * numServings,
-            totalCarbs: macros.carbs * numServings,
-            totalFat: macros.fat * numServings,
-          },
-          scaled: result.scaled,
-        };
-      });
+      } else {
+        const prompt = buildMealPrepPrompt(...promptParts, false);
+        const rawText = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
+        let data;
+        try {
+          data = parseAIJson(rawText);
+        } catch (parseError) {
+          console.error(`Failed to parse ${provider} response. Raw text:`, rawText);
+          throw parseError;
+        }
+        options = mapOptionsFromEstimate(data.options || []);
+      }
 
       console.log(`✅ Generated ${options.length} meal prep options (${provider})`);
 

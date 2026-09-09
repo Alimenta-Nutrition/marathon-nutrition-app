@@ -1,7 +1,7 @@
 // src/components/modals/MealPrepModal.js
 import React, { useState, useEffect } from 'react';
 import { ChefHat, Check, Loader2, Clock, Refrigerator, ChevronLeft, Heart } from 'lucide-react';
-import { authenticatedFetch, getMealGenApiUrl } from '../../../shared/services/api';
+import { authenticatedFetch, getApiUrl, getMealGenApiUrl } from '../../../shared/services/api';
 import { macroColors } from '../../../shared/lib/macroColors';
 import { getLocalDateString } from '../../dataClient';
 import {
@@ -25,12 +25,14 @@ export const MealPrepModal = ({
   isGuest,
   defaultMealType,
   defaultDays,
+  weekStarting,
 }) => {
   const [step, setStep] = useState(1); // 1: meal type, 2: days, 3: options
   const [selectedMealType, setSelectedMealType] = useState('lunch');
   const [selectedDays, setSelectedDays] = useState([]);
   const [options, setOptions] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
   const [error, setError] = useState('');
   const [applied, setApplied] = useState(false);
   const [saveToFavorites, setSaveToFavorites] = useState(false);
@@ -48,6 +50,7 @@ export const MealPrepModal = ({
       setOptions([]);
       setError('');
       setApplied(false);
+      setIsApplying(false);
     }
   }, [isOpen]);
 
@@ -103,20 +106,55 @@ export const MealPrepModal = ({
   };
 
   const handleSelectOption = async (option) => {
-    // Apply to all selected days
-    selectedDays.forEach(day => {
-      onApply(day, selectedMealType, option.fullDescription);
-    });
+    if (applied || isApplying) return;
 
-    // Save to favorites if checked
-    if (saveToFavorites && onSaveMeal && !isGuest) {
-      await onSaveMeal(selectedMealType, option.fullDescription);
+    if (!option?.meal_v2) {
+      setError('This option is missing structured meal data and cannot be applied.');
+      return;
     }
 
-    setApplied(true);
-    setTimeout(() => {
-      handleClose();
-    }, 1000);
+    if (!isGuest && !weekStarting) {
+      setError('Missing week starting date. Please close and try again.');
+      return;
+    }
+
+    setIsApplying(true);
+    setError('');
+
+    try {
+      for (const day of selectedDays) {
+        if (!isGuest) {
+          const response = await authenticatedFetch(getApiUrl('/api/apply-meal-prep'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              day,
+              mealType: selectedMealType,
+              weekStarting,
+              mealV2: option.meal_v2,
+            }),
+          });
+          const result = await response.json();
+          if (!result.success) {
+            throw new Error(result.error || 'Failed to apply meal prep');
+          }
+        }
+        onApply(day, selectedMealType, option.fullDescription, option.meal_v2);
+      }
+
+      if (saveToFavorites && onSaveMeal && !isGuest) {
+        await onSaveMeal(selectedMealType, option.fullDescription);
+      }
+
+      setApplied(true);
+      setTimeout(() => {
+        handleClose();
+      }, 1000);
+    } catch (err) {
+      setError(err.message || 'Failed to apply meal prep');
+    } finally {
+      setIsApplying(false);
+    }
   };
 
   const handleClose = () => {
@@ -127,6 +165,7 @@ export const MealPrepModal = ({
     setError('');
     setApplied(false);
     setSaveToFavorites(false);
+    setIsApplying(false);
     onClose();
   };
 
@@ -289,7 +328,7 @@ export const MealPrepModal = ({
                   <div
                     key={idx}
                     className="p-4 border rounded-lg hover:border-primary hover:shadow-md transition-all cursor-pointer group"
-                    onClick={() => !applied && handleSelectOption(option)}
+                    onClick={() => !applied && !isApplying && handleSelectOption(option)}
                   >
                     <div className="flex justify-between items-start gap-2">
                       <div className="flex-1">
@@ -347,6 +386,7 @@ export const MealPrepModal = ({
                           e.stopPropagation();
                           handleSelectOption(option);
                         }}
+                        disabled={applied || isApplying}
                       >
                         Select
                       </button>
@@ -369,6 +409,19 @@ export const MealPrepModal = ({
                 </label>
               )}
 
+              {error && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                  {error}
+                </div>
+              )}
+
+              {isApplying && (
+                <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg text-primary text-sm flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Applying to {selectedDays.length} day{selectedDays.length === 1 ? '' : 's'}...
+                </div>
+              )}
+
               {applied && (
                 <div className="p-4 bg-green-50 border border-green-200 rounded-lg text-green-700 flex items-center gap-2">
                   <Check className="w-5 h-5" />
@@ -380,7 +433,7 @@ export const MealPrepModal = ({
 
               <button
                 onClick={handleBack}
-                disabled={applied}
+                disabled={applied || isApplying}
                 className="w-full py-2 border border-gray-300 text-gray-700 rounded-lg font-medium hover:bg-gray-50 transition-colors flex items-center justify-center gap-1 disabled:opacity-50"
               >
                 <ChevronLeft className="w-4 h-4" />
