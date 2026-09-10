@@ -26,7 +26,11 @@ import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
 import { OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
 import { getMealById } from '../lib/mealStore.js';
-import { buildLegacyRecipePrompt, buildStructuredRecipePrompt } from '../lib/recipePrompt.js';
+import {
+  buildConsumedTargets,
+  buildLegacyRecipePrompt,
+  buildStructuredRecipePrompt,
+} from '../lib/recipePrompt.js';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -132,7 +136,22 @@ function recipeSchema(maxServings = 6) {
 
 // ─── Display Formatter ───────────────────────────────────────────────────────
 
-function toCookbookText(r) {
+function stripNutritionNoteLines(notes) {
+  if (!notes || typeof notes !== 'string') return '';
+  return notes
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line) return false;
+      if (/^nutrition\b/i.test(line)) return false;
+      if (/\bkcal\b/i.test(line) && /\d+\s*g\s*P/i.test(line)) return false;
+      return true;
+    })
+    .join('\n')
+    .trim();
+}
+
+function toCookbookText(r, macros = null) {
   const lines = [];
   lines.push(r.title || 'Recipe');
   lines.push(`Servings: ${r.servings ?? 1}`);
@@ -147,10 +166,17 @@ function toCookbookText(r) {
   lines.push('');
   lines.push('Steps:');
   (r.steps || []).forEach((s, idx) => lines.push(`${idx + 1}. ${s}`));
-  if (r.notes) {
+  if (macros) {
+    lines.push('');
+    lines.push(
+      `Nutrition (1 serving): ${macros.calories} kcal, ${macros.protein}g P, ${macros.carbs}g C, ${macros.fat}g F.`
+    );
+  }
+  const notes = stripNutritionNoteLines(r.notes);
+  if (notes) {
     lines.push('');
     lines.push('Notes:');
-    lines.push(r.notes);
+    lines.push(notes);
   }
   return lines.join('\n');
 }
@@ -256,6 +282,9 @@ export default async function handler(req, res) {
 
     const clampedServings = Math.min(6, Math.max(1, Math.round(servings)));
     const useStructured = structuredIngredients.length > 0;
+    const consumedTargets = useStructured
+      ? buildConsumedTargets(structuredIngredients, clampedServings)
+      : [];
 
     // Build banned list for post-generation filtering
     const bannedList = [
@@ -269,6 +298,7 @@ export default async function handler(req, res) {
       ? buildStructuredRecipePrompt({
           mealName: mealLabel,
           ingredients: structuredIngredients,
+          consumedTargets,
           servings: clampedServings,
           mealTypeLabel,
           macros,
@@ -317,14 +347,11 @@ export default async function handler(req, res) {
       structured.ingredients = filterDislikedFromStrings(structured.ingredients, bannedList);
     }
 
-    if (useStructured && macros) {
-      const nutritionLine = `Nutrition (${clampedServings === 1 ? '1 serving' : `1 serving; recipe is for ${clampedServings}`}): ${macros.calories} kcal, ${macros.protein}g P, ${macros.carbs}g C, ${macros.fat}g F.`;
-      structured.notes = structured.notes
-        ? `${structured.notes}\n${nutritionLine}`
-        : nutritionLine;
+    if (structured.notes) {
+      structured.notes = stripNutritionNoteLines(structured.notes);
     }
 
-    const recipe = toCookbookText(structured);
+    const recipe = toCookbookText(structured, useStructured ? macros : null);
     return res.status(200).json({ success: true, recipe, structured });
   } catch (error) {
     console.error('Recipe error:', error);
