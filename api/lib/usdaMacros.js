@@ -6,7 +6,6 @@
 import {
   MIN_SCALE,
   MAX_SCALE,
-  PORTION_BOUNDS,
   TYPE_DENSITIES,
 } from '../../shared/lib/macroEstimator.js';
 import { normalizeQuery } from './usdaLookup.js';
@@ -16,6 +15,20 @@ const INGREDIENT_TYPES = ['protein', 'carb', 'vegetable', 'fat'];
 const REL_TOLERANCE = 0.05;
 const ABS_FLOOR = { calories: 10, protein: 1, carbs: 1, fat: 1 };
 const MAX_SOLVE_ITERS = 8;
+
+/**
+ * Realistic cooked-portion bounds for AI-generated meals only.
+ * Logged meals use calculateLoggedMealNutrition and never read these.
+ * Absent types are not invented to satisfy a minimum.
+ */
+export const GENERATION_PORTION_BOUNDS = {
+  protein: { min: 120, max: 250 },
+  carb: { min: 150, max: 300 },
+  vegetable: { min: 80, max: 200 },
+  fat: { min: 5, max: 20 },
+};
+
+const IDENTITY_SCALES = { protein: 1, carb: 1, vegetable: 1, fat: 1 };
 
 export function normalizeIngredientList(raw) {
   return (raw || [])
@@ -247,16 +260,59 @@ function clampScale(s) {
   return Math.max(MIN_SCALE, Math.min(MAX_SCALE, s));
 }
 
+function countType(resolved, type) {
+  return resolved.filter(
+    (ing) => ing.type === type && (Number(ing.originalGrams) || 0) > 0
+  ).length;
+}
+
+function proteinFromProteinTypes(resolved) {
+  let protein = 0;
+  for (const ing of resolved) {
+    if ((ing.type || '') !== 'protein') continue;
+    protein += (Number(ing.grams) || 0) * (Number(ing.protein_per_g) || 0);
+  }
+  return protein;
+}
+
+function hasProteinType(resolved) {
+  return resolved.some(
+    (ing) => ing.type === 'protein' && (Number(ing.grams) || Number(ing.originalGrams) || 0) > 0
+  );
+}
+
+/**
+ * Score protein using protein-type foods only so rice/veg protein cannot
+ * justify collapsing the entrée. Calories/carbs/fat still use the full plate.
+ */
+function nutritionForScoring(resolved) {
+  const full = nutritionFromDensities(resolved);
+  if (!hasProteinType(resolved)) return full;
+  return { ...full, protein: proteinFromProteinTypes(resolved) };
+}
+
+function typeVectorForSolve(resolved, type) {
+  const v = typeVectorAtOriginal(resolved, type);
+  if (type !== 'protein') {
+    return { ...v, protein: 0 };
+  }
+  return v;
+}
+
 function applyTypeScales(resolved, scales) {
+  const singleCarb = countType(resolved, 'carb') === 1;
   return resolved.map((ing) => {
     const type = ing.type || '';
     const s = scales[type] ?? 1;
-    const bounds = PORTION_BOUNDS[type] || { min: 0, max: 500 };
+    const bounds = GENERATION_PORTION_BOUNDS[type] || { min: 0, max: 500 };
     const original = Number(ing.originalGrams) || 0;
     const relMin = original * MIN_SCALE;
     const relMax = original * MAX_SCALE;
     let lo = Math.max(bounds.min, relMin);
     let hi = Math.min(bounds.max, relMax);
+    if (singleCarb && type === 'carb') {
+      hi = Math.min(hi, Math.max(original, bounds.min));
+    }
     let grams;
     if (lo > hi) {
       grams = Math.max(bounds.min, Math.min(bounds.max, original));
@@ -313,7 +369,7 @@ function solveTypeScales(resolved, target) {
   const vecs = {};
   const usable = [];
   for (const type of types) {
-    const v = typeVectorAtOriginal(resolved, type);
+    const v = typeVectorForSolve(resolved, type);
     const mag = keys.reduce((s, k) => s + Math.abs(v[k]), 0);
     if (mag < 1e-9) continue;
     vecs[type] = v;
@@ -347,8 +403,9 @@ function solveTypeScales(resolved, target) {
 
 function analyticScaleForType(resolved, scales, type, target) {
   const others = applyTypeScales(resolved, { ...scales, [type]: 0 });
-  const base = nutritionFromDensities(others.filter((ing) => ing.type !== type));
-  const v = typeVectorAtOriginal(resolved, type);
+  const withoutType = others.filter((ing) => ing.type !== type);
+  const base = nutritionForScoring(withoutType);
+  const v = typeVectorForSolve(resolved, type);
   let num = 0;
   let den = 0;
   for (const key of MEAL_MACRO_KEYS) {
@@ -369,14 +426,14 @@ function lineSearchType(resolved, scales, type, target) {
     .map(clampScale);
 
   let best = scales[type] ?? 1;
-  let bestScore = errorScore(nutritionFromDensities(applyTypeScales(resolved, scales)), target);
+  let bestScore = errorScore(nutritionForScoring(applyTypeScales(resolved, scales)), target);
   const seen = new Set();
   for (const s of candidates) {
     const key = s.toFixed(4);
     if (seen.has(key)) continue;
     seen.add(key);
     const trial = { ...scales, [type]: s };
-    const score = errorScore(nutritionFromDensities(applyTypeScales(resolved, trial)), target);
+    const score = errorScore(nutritionForScoring(applyTypeScales(resolved, trial)), target);
     if (score + 1e-12 < bestScore) {
       bestScore = score;
       best = s;
@@ -397,18 +454,18 @@ function gramsChanged(resolved) {
  */
 export function adjustIngredientsToBudget(resolved, budget) {
   const types = presentTypes(resolved);
-  let scales = { protein: 1, carb: 1, vegetable: 1, fat: 1 };
+  let scales = { ...IDENTITY_SCALES };
   let current = applyTypeScales(resolved, scales);
   let best = {
     resolved: current,
     scales: { ...scales },
-    score: errorScore(nutritionFromDensities(current), budget),
+    score: errorScore(nutritionForScoring(current), budget),
   };
 
   const wls = solveTypeScales(resolved, budget);
   if (wls) {
     current = applyTypeScales(resolved, wls);
-    const score = errorScore(nutritionFromDensities(current), budget);
+    const score = errorScore(nutritionForScoring(current), budget);
     if (score <= best.score) {
       best = { resolved: current, scales: { ...wls }, score };
       scales = wls;
@@ -420,7 +477,7 @@ export function adjustIngredientsToBudget(resolved, budget) {
       scales = { ...scales, [type]: lineSearchType(resolved, scales, type, budget) };
     }
     current = applyTypeScales(resolved, scales);
-    const score = errorScore(nutritionFromDensities(current), budget);
+    const score = errorScore(nutritionForScoring(current), budget);
     if (score + 1e-12 < best.score) {
       best = { resolved: current, scales: { ...scales }, score };
     }
@@ -529,8 +586,10 @@ function finishComputed(resolved, macroSource, scaled, scaleFactors) {
 
 /**
  * Ground ingredients in USDA per-100g data, with TYPE_DENSITIES fallback.
- * If totals drift more than 5% from budget, adjust grams using actual
- * nutrient densities (not generic type averages).
+ * Generation portions are clamped to GENERATION_PORTION_BOUNDS. If totals
+ * still drift more than 5% from budget, adjust grams using actual nutrient
+ * densities. Realism can beat an exact 5% fit. Meal macros are always the
+ * ingredient sum. Logged meals must use calculateLoggedMealNutrition instead.
  */
 export function computeUsdaMacros(ingredients, usdaResults, budget) {
   const list = Array.isArray(ingredients) ? ingredients : [];
@@ -548,10 +607,22 @@ export function computeUsdaMacros(ingredients, usdaResults, budget) {
 
   const resolved = list.map((ing) => resolveIngredient(ing, usdaResults));
   const macroSource = mealMacroSource(resolved);
-  const initialNutrition = nutritionFromDensities(resolved);
 
-  if (!budget || isWithinBudgetTolerance(initialNutrition, budget)) {
+  if (!budget) {
     return finishComputed(resolved, macroSource, false, null);
+  }
+
+  const clamped = applyTypeScales(resolved, IDENTITY_SCALES);
+  const clampedNutrition = nutritionFromDensities(clamped);
+
+  if (isWithinBudgetTolerance(clampedNutrition, budget)) {
+    const scaled = gramsChanged(clamped);
+    return finishComputed(
+      clamped,
+      macroSource,
+      scaled,
+      scaled ? { ...IDENTITY_SCALES } : null
+    );
   }
 
   const adjusted = adjustIngredientsToBudget(resolved, budget);
