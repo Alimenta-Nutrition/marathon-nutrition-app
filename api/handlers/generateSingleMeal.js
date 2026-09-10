@@ -7,7 +7,7 @@ import { computeNutritionTargets, withNumericIntensities, deriveWorkoutTiming } 
 import { estimateAndAdjust } from '../../shared/lib/macroEstimator.js';
 import { buildSingleMealPrompt, formatTrainingDay } from '../../shared/lib/mealPromptBuilder.js';
 import { validateIngredients } from '../../shared/lib/validateIngredients.js';
-import { completeJSON, completeMealWithUsda, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
+import { completeJSON, completeMealWithUsda, isHighDemandError, OPENAI_MEAL_MODEL, OPENAI_MEAL_MODELS } from '../lib/aiCompletion.js';
 import { parseAIJson } from '../lib/parseAIJson.js';
 import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
@@ -44,6 +44,28 @@ function roundMacrosInt(macros) {
     carbs: Math.round(macros.carbs),
     fat: Math.round(macros.fat),
   };
+}
+
+/** Copyable dump of the exact user message (+ request metadata) sent to the model. */
+export function formatSingleMealPromptDump({ prompt, provider, useUsda }) {
+  const model =
+    provider === 'openai'
+      ? useUsda
+        ? OPENAI_MEAL_MODELS['5.4-mini'] || OPENAI_MEAL_MODEL
+        : OPENAI_MEAL_MODEL
+      : AI_CONFIG.gemini.geminiModel;
+  const header = [`Provider: ${provider}`, `Model: ${model}`];
+  if (provider === 'openai' && useUsda) {
+    header.push('API: OpenAI Responses');
+    header.push('Reasoning effort: none');
+    header.push('Tools: lookup_nutrition');
+  } else if (provider === 'openai') {
+    header.push('API: OpenAI Chat Completions (JSON)');
+  }
+  header.push('');
+  header.push('----- USER PROMPT -----');
+  header.push('');
+  return `${header.join('\n')}${prompt}`;
 }
 
 function extractProteins(mealStr) {
@@ -97,21 +119,24 @@ export function createGenerateSingleMealHandler(provider) {
         ragContext,
         includeDessert,
         localDate,
+        previewPrompt,
       } = req.body;
 
       if (!userProfile || !day || !rawMealType) {
         return res.status(400).json({ success: false, error: 'Missing required fields' });
       }
 
-      const limitCheck = await checkAndIncrementUsage(supabase, userId, 'meal_generation');
-      if (!limitCheck.allowed) {
-        return res.status(429).json({
-          success: false,
-          error: limitCheck.reason === 'daily_limit_reached' ? 'Daily limit reached.' : 'Unable to verify daily limit.',
-          limitReached: true,
-          limit: limitCheck.limit,
-          reason: limitCheck.reason,
-        });
+      if (!previewPrompt) {
+        const limitCheck = await checkAndIncrementUsage(supabase, userId, 'meal_generation');
+        if (!limitCheck.allowed) {
+          return res.status(429).json({
+            success: false,
+            error: limitCheck.reason === 'daily_limit_reached' ? 'Daily limit reached.' : 'Unable to verify daily limit.',
+            limitReached: true,
+            limit: limitCheck.limit,
+            reason: limitCheck.reason,
+          });
+        }
       }
 
       const inactiveError = getInactiveMealTypeError(rawMealType, { includeDessert });
@@ -185,6 +210,20 @@ export function createGenerateSingleMealHandler(provider) {
         ragContext: ragContext || null,
       };
 
+      const useUsda = provider === 'openai';
+      const prompt = buildSingleMealPrompt({ ...promptArgs, useUsda });
+
+      if (previewPrompt) {
+        return res.status(200).json({
+          success: true,
+          preview: true,
+          prompt: formatSingleMealPromptDump({ prompt, provider, useUsda }),
+          day,
+          mealType: outKey,
+          provider,
+        });
+      }
+
       console.log(`🍽️ Generating ${rawMealType} for ${day} (${provider})${userPrompt ? ` (hint: "${userPrompt}")` : ''}`);
 
       let mealString;
@@ -211,7 +250,6 @@ export function createGenerateSingleMealHandler(provider) {
       if (provider === 'openai') {
         const usdaStarted = Date.now();
         try {
-          const prompt = buildSingleMealPrompt({ ...promptArgs, useUsda: true });
           const { parsed, toolRounds, usdaResults } = await completeMealWithUsda({
             prompt,
             reasoningEffort: 'none',
