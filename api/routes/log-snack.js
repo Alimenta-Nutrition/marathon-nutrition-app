@@ -44,6 +44,15 @@ const DAY_NAMES_SUN_FIRST = [
 ];
 
 const MACRO_MAX = { calories: 2000, protein: 300, carbs: 300, fat: 300 };
+const ALLOWED_MACRO_SOURCES = new Set([
+  'ml_estimate',
+  'user_entered',
+  'usda',
+  'usda_partial',
+  'type_density',
+]);
+const ALLOWED_INGREDIENT_MACRO_SOURCES = new Set(['usda', 'type_density']);
+const MEAL_MACRO_KEYS = ['calories', 'protein', 'carbs', 'fat'];
 
 /**
  * Day-of-week for a client local calendar date (YYYY-MM-DD).
@@ -72,6 +81,53 @@ function isTodaySnackDay({ day, weekStarting, localDate }) {
   const todayName = dayOfWeekFromLocalDate(localDate);
   const monday = mondayOfWeekContaining(localDate);
   return day === todayName && weekStarting === monday;
+}
+
+function isNonNegFinite(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0;
+}
+
+function validateIngredients(raw) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error('ingredients must be an array');
+  }
+
+  return raw.map((ing, index) => {
+    if (!ing || typeof ing !== 'object' || Array.isArray(ing)) {
+      throw new Error(`ingredients[${index}] is invalid`);
+    }
+    const name = String(ing.name || '').trim();
+    if (!name) {
+      throw new Error(`ingredients[${index}].name is required`);
+    }
+    if (!isNonNegFinite(ing.grams)) {
+      throw new Error(`ingredients[${index}].grams must be a finite non-negative number`);
+    }
+
+    const presentMacros = MEAL_MACRO_KEYS.filter((key) => ing[key] != null && ing[key] !== '');
+    if (presentMacros.length > 0) {
+      for (const key of MEAL_MACRO_KEYS) {
+        if (!isNonNegFinite(ing[key])) {
+          throw new Error(`ingredients[${index}].${key} must be a finite non-negative number`);
+        }
+      }
+    }
+
+    if (ing.macro_source != null && ing.macro_source !== '') {
+      const source = String(ing.macro_source).trim();
+      if (!ALLOWED_INGREDIENT_MACRO_SOURCES.has(source)) {
+        throw new Error(`ingredients[${index}].macro_source is invalid`);
+      }
+    }
+
+    return ing;
+  });
+}
+
+function clientSentMacroSource(body) {
+  return body?.macroSource != null && String(body.macroSource).trim() !== '';
 }
 
 function validateMacros({ calories, protein, carbs, fat }) {
@@ -360,8 +416,25 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: validated.error });
     }
     const macros = validated.macros;
-    const snackIngredients = Array.isArray(body.ingredients) ? body.ingredients : [];
-    const snackMacroSource = String(body.macroSource || 'user_entered').trim() || 'user_entered';
+    let snackIngredients;
+    try {
+      snackIngredients = validateIngredients(body.ingredients);
+    } catch (err) {
+      return res.status(400).json({ success: false, error: err.message });
+    }
+
+    const snackMacroSource = clientSentMacroSource(body)
+      ? String(body.macroSource).trim()
+      : 'user_entered';
+    if (!ALLOWED_MACRO_SOURCES.has(snackMacroSource)) {
+      return res.status(400).json({ success: false, error: 'Invalid macroSource' });
+    }
+
+    // New clients send macroSource and/or structured ingredients. Those must
+    // not appear logged if the normalized meals write fails. Old App Store
+    // clients omit both and still succeed on JSONB when meals is missing.
+    const requireNormalizedSave =
+      clientSentMacroSource(body) || snackIngredients.length > 0;
 
     const snackString = formatMealString(name, macros);
     dayMeals.snacks = snackString;
@@ -399,7 +472,7 @@ export default async function handler(req, res) {
       rebalanced = true;
     }
 
-    await tryNormalized('save snacks row', () =>
+    const persistSnackRow = () =>
       saveMeal({
         userId,
         date,
@@ -415,8 +488,13 @@ export default async function handler(req, res) {
         isUserLogged: true,
         rating: null,
         ingredients: snackIngredients,
-      })
-    );
+      });
+
+    if (requireNormalizedSave) {
+      await persistSnackRow();
+    } else {
+      await tryNormalized('save snacks row', persistSnackRow);
+    }
 
     for (const mt of adjustedMealTypes) {
       if (!normalizedByType[mt] && !resultDay[`${mt}_v2`]) continue;

@@ -2,6 +2,8 @@ export const LIMITS = {
   meal_generation: 10,
   recipe_generation: 5,
   grocery_list: 3,
+  // Shared by Log Meal + Log Snack AI interpretation (POST /api/estimate-macros only).
+  food_logging: 20,
 };
 
 export async function checkAndIncrementUsage(supabase, userId, actionType) {

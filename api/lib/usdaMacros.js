@@ -125,6 +125,25 @@ function resolveUsdaRow(name, usdaMap) {
   return aliased ? aliased[1] : null;
 }
 
+function usdaProvenance(usda) {
+  if (!usda) {
+    return { usda_description: null, usda_data_type: null, confidence: null };
+  }
+  const confidence =
+    usda.confidence == null || usda.confidence === ''
+      ? null
+      : Number.isFinite(Number(usda.confidence))
+        ? Number(usda.confidence)
+        : null;
+  const description = usda.description != null ? String(usda.description).trim() : '';
+  const dataType = usda.data_type != null ? String(usda.data_type).trim() : '';
+  return {
+    usda_description: description || null,
+    usda_data_type: dataType || null,
+    confidence,
+  };
+}
+
 function resolveIngredient(ing, usdaMap) {
   const grams = Math.round(parseFloat(ing.grams) || 0);
   const type = String(ing.type || '').trim().toLowerCase();
@@ -142,6 +161,7 @@ function resolveIngredient(ing, usdaMap) {
       fat_per_g: Number(usda.fat_per_100g) / 100 || 0,
       usda_fdc_id: usda.fdc_id ?? null,
       macro_source: 'usda',
+      ...usdaProvenance(usda),
     };
   }
 
@@ -160,6 +180,7 @@ function resolveIngredient(ing, usdaMap) {
     fat_per_g: f,
     usda_fdc_id: null,
     macro_source: 'type_density',
+    ...usdaProvenance(null),
   };
 }
 
@@ -195,6 +216,9 @@ function toOutputIngredients(resolved) {
       fat: round1(g * ing.fat_per_g),
       usda_fdc_id: ing.usda_fdc_id,
       macro_source: ing.macro_source,
+      usda_description: ing.usda_description ?? null,
+      usda_data_type: ing.usda_data_type ?? null,
+      confidence: ing.confidence ?? null,
     };
   });
 }
@@ -462,15 +486,6 @@ export function calculateLoggedMealNutrition(ingredients, usdaResults) {
     const row = resolveIngredient(ing, usdaResults);
     row.grams = ing.grams;
     row.originalGrams = ing.grams;
-    const usda = resolveUsdaRow(ing.name, usdaResults);
-    row.usda_description = usda?.description ?? null;
-    row.usda_data_type = usda?.data_type ?? null;
-    row.confidence =
-      usda?.confidence == null || usda?.confidence === ''
-        ? null
-        : Number.isFinite(Number(usda.confidence))
-          ? Number(usda.confidence)
-          : null;
     return row;
   });
 

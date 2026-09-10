@@ -42,7 +42,7 @@ const NUTRIENT_IDS = {
 const DATA_TYPES = ['Foundation', 'SR Legacy', 'Survey (FNDDS)'];
 
 const PROCESSED_RE =
-  /\b(crackers|chips|snack|baby ?food|infant|formula|nuggets|tenders|breaded|ready-to-eat|cereals?)\b|bar,/i;
+  /\b(crackers|chips|snack|baby ?food|infant|formula|nuggets|tenders|breaded|ready-to-eat|cereals?|soup|stew|gravy)\b|bar,/i;
 const COOKED_RE = /\b(cooked|boiled|roasted)\b/i;
 const SCORE_STOPWORDS = new Set([
   'without',
@@ -190,6 +190,40 @@ function escapeRegExp(value) {
 
 function descriptionHasToken(description, token) {
   return new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i').test(description);
+}
+
+/**
+ * Lightweight rejection of USDA rows that cannot be a real food match.
+ * Oil ~884 kcal/100g is allowed; values above 900 or macros > 100g are not.
+ */
+export function nutrientsArePlausible(nutrients) {
+  if (!nutrients || typeof nutrients !== 'object') return false;
+  const calories = Number(nutrients.calories_per_100g);
+  const protein = Number(nutrients.protein_per_100g);
+  const carbs = Number(nutrients.carbs_per_100g);
+  const fat = Number(nutrients.fat_per_100g);
+  if (!Number.isFinite(calories) || calories <= 0 || calories > 900) return false;
+  if (![protein, carbs, fat].every((n) => Number.isFinite(n) && n >= 0 && n <= 100)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Reject results whose description shares none of the query's meaningful tokens
+ * (e.g. "chicken" vs "Turkey, ground") or is a processed dish for a simple food.
+ */
+export function isIncompatibleUsdaMatch(food, query, score = 0) {
+  const desc = String(food?.description || '');
+  const queryText = String(query || '').toLowerCase();
+  const tokens = queryTokens(queryText).filter((token) => token.length >= 3);
+  if (tokens.length > 0 && tokens.every((token) => !descriptionHasToken(desc, token))) {
+    return true;
+  }
+  if (PROCESSED_RE.test(desc) && !PROCESSED_RE.test(queryText) && Number(score) < 3) {
+    return true;
+  }
+  return false;
 }
 
 export function extractNutrients(food) {
@@ -348,6 +382,18 @@ export async function resolveBestFood(foods, query, apiKey) {
       }
     }
     if (nutrients.calories_per_100g == null) continue;
+    if (!nutrientsArePlausible(nutrients)) {
+      console.log(
+        `[usda] skip implausible nutrients fdcId=${food.fdcId} desc="${food.description}" cal=${nutrients.calories_per_100g}`
+      );
+      continue;
+    }
+    if (isIncompatibleUsdaMatch(food, query, score)) {
+      console.log(
+        `[usda] skip incompatible match query="${query}" best="${food.description}" score=${score}`
+      );
+      continue;
+    }
     const maxScore = Math.max(1, maxPossibleScore(query));
     const confidence = Math.max(0, Math.min(1, score / maxScore));
     return { food, score, confidence, nutrients };

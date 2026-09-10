@@ -121,6 +121,25 @@ export default async function handler(req, res) {
       console.error('Error deleting meal_plans:', mealPlansError);
     }
 
+    // 3b. Normalized meals (meal_ingredients cascade from meals)
+    const { error: mealsError } = await supabase
+      .from('meals')
+      .delete()
+      .eq('user_id', userId);
+
+    if (mealsError) {
+      console.error('[delete-account] Error deleting meals:', mealsError.message);
+    }
+
+    const { error: daySettingsError } = await supabase
+      .from('day_settings')
+      .delete()
+      .eq('user_id', userId);
+
+    if (daySettingsError) {
+      console.error('[delete-account] Error deleting day_settings:', daySettingsError.message);
+    }
+
     // 4. Delete training plans
     const { error: trainingError } = await supabase
       .from('training_plans')

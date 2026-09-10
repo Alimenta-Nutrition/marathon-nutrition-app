@@ -14,6 +14,7 @@
  *   servings?,
  *   dislikes?,
  *   dietaryRestrictions?,
+ *   mealId?,              // additive: load this user's normalized meal + ingredients
  * }
  *
  * Returns: { success, recipe (display string), structured (JSON) }
@@ -24,6 +25,8 @@ import { createClient } from '@supabase/supabase-js';
 import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
 import { OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
+import { getMealById } from '../lib/mealStore.js';
+import { buildLegacyRecipePrompt, buildStructuredRecipePrompt } from '../lib/recipePrompt.js';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -186,11 +189,49 @@ export default async function handler(req, res) {
       servings = 1,
       dislikes = '',
       dietaryRestrictions = '',
-    } = req.body;
+      mealId: mealIdInput,
+    } = req.body || {};
 
     const parsedFromMeal = parseMealString(typeof meal === 'string' ? meal : '');
-    const description = String(descriptionInput || parsedFromMeal.description || '').trim();
-    const macros = normalizeMacros(macrosInput) || parsedFromMeal.macros;
+    let description = String(descriptionInput || parsedFromMeal.description || '').trim();
+    let macros = normalizeMacros(macrosInput) || parsedFromMeal.macros;
+    let structuredIngredients = [];
+
+    const mealId = String(mealIdInput || '').trim();
+    if (mealId) {
+      if (!userId) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+      let ownedMeal;
+      try {
+        ownedMeal = await getMealById({ userId, mealId });
+      } catch (err) {
+        console.error('[get-recipe] failed to load meal ingredients:', err);
+        return res.status(500).json({
+          success: false,
+          error: 'Could not load this meal for a recipe.',
+        });
+      }
+      if (!ownedMeal) {
+        return res.status(404).json({
+          success: false,
+          error: 'Meal not found.',
+        });
+      }
+      description = String(ownedMeal.meal_name || description).trim();
+      macros =
+        normalizeMacros({
+          calories: ownedMeal.calories,
+          protein: ownedMeal.protein,
+          carbs: ownedMeal.carbs,
+          fat: ownedMeal.fat,
+        }) || macros;
+      structuredIngredients = Array.isArray(ownedMeal.ingredients)
+        ? ownedMeal.ingredients.filter(
+            (ing) => String(ing?.name || '').trim() && Number(ing?.grams) > 0
+          )
+        : [];
+    }
 
     if (!description && !(typeof meal === 'string' && meal.trim())) {
       return res.status(400).json({ success: false, error: 'Missing meal description' });
@@ -214,6 +255,7 @@ export default async function handler(req, res) {
     }
 
     const clampedServings = Math.min(6, Math.max(1, Math.round(servings)));
+    const useStructured = structuredIngredients.length > 0;
 
     // Build banned list for post-generation filtering
     const bannedList = [
@@ -223,32 +265,24 @@ export default async function handler(req, res) {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
-    // Build prompt with meal context + preference constraints
-    let constraintBlock = '';
-    if (dietaryRestrictions) {
-      constraintBlock += `\n- DIETARY RESTRICTIONS (MUST follow — never include forbidden foods): ${dietaryRestrictions}`;
-    }
-    if (dislikes) {
-      constraintBlock += `\n- DISLIKED FOODS (NEVER use any of these as ingredients): ${dislikes}`;
-      constraintBlock += `\n- If the meal name contains a disliked ingredient, substitute it with a similar alternative.`;
-    }
-
-    let contextBlock = '';
-    if (mealTypeLabel) {
-      contextBlock += `\n- Meal type: ${mealTypeLabel} — keep methods and portions appropriate for this meal type.`;
-    }
-    if (macros) {
-      contextBlock += `\n- Target macros for 1 serving of this meal: ${macros.calories} kcal, ${macros.protein}g protein, ${macros.carbs}g carbs, ${macros.fat}g fat.`;
-      contextBlock += `\n- Scale ingredient amounts so the finished dish approximately matches those macros per serving, then scale the written recipe to ${clampedServings} serving${clampedServings > 1 ? 's' : ''}.`;
-    }
-
-    const prompt = `Write a concise cookbook-style recipe for: "${mealLabel}".
-- Servings: exactly ${clampedServings}.
-- Ingredients with amounts scaled for ${clampedServings} serving${clampedServings > 1 ? 's' : ''}.
-- Step-by-step instructions.
-- Prep/cook/total time (minutes).
-- Optional brief notes.${contextBlock}${constraintBlock}
-Return ONLY JSON that matches the provided schema. No extra text.`;
+    const prompt = useStructured
+      ? buildStructuredRecipePrompt({
+          mealName: mealLabel,
+          ingredients: structuredIngredients,
+          servings: clampedServings,
+          mealTypeLabel,
+          macros,
+          dietaryRestrictions,
+          dislikes,
+        })
+      : buildLegacyRecipePrompt({
+          mealLabel,
+          servings: clampedServings,
+          mealTypeLabel,
+          macros,
+          dietaryRestrictions,
+          dislikes,
+        });
 
     const isGpt5 = String(OPENAI_MEAL_MODEL).toLowerCase().startsWith('gpt-5');
     const request = {
@@ -281,6 +315,13 @@ Return ONLY JSON that matches the provided schema. No extra text.`;
     // Post-generation: remove any disliked ingredients that slipped through
     if (bannedList.length > 0 && structured.ingredients) {
       structured.ingredients = filterDislikedFromStrings(structured.ingredients, bannedList);
+    }
+
+    if (useStructured && macros) {
+      const nutritionLine = `Nutrition (${clampedServings === 1 ? '1 serving' : `1 serving; recipe is for ${clampedServings}`}): ${macros.calories} kcal, ${macros.protein}g P, ${macros.carbs}g C, ${macros.fat}g F.`;
+      structured.notes = structured.notes
+        ? `${structured.notes}\n${nutritionLine}`
+        : nutritionLine;
     }
 
     const recipe = toCookbookText(structured);

@@ -381,6 +381,26 @@ export async function getMealWithIngredients({
   };
 }
 
+/**
+ * Fetch one normalized meal by id, scoped to the authenticated user.
+ * Returns the API-mapped meal (including ingredients) or null.
+ */
+export async function getMealById({ userId, mealId }) {
+  const id = String(mealId || '').trim();
+  if (!userId || !id) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from('meals')
+    .select(MEALS_WITH_INGREDIENTS_SELECT)
+    .eq('id', id)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  throwIfQueryError(error, 'getMealById');
+  if (!data) return null;
+  return mapMealForApi(data);
+}
+
 const MEAL_TYPE_ORDER = {
   breakfast: 0,
   lunch: 1,

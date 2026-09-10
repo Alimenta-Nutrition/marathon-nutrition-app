@@ -1,5 +1,6 @@
 /**
- * Log Meal estimation: OpenAI extracts foods+grams, USDA calculates macros.
+ * Shared structured food estimation for Log Meal and Log Snack.
+ * OpenAI extracts foods+grams; USDA/type-density calculate macros.
  * Does not use meal-budget optimizers. ML totals remain a fallback only.
  */
 
@@ -108,9 +109,12 @@ export async function estimateLoggedMealStructured(description, mealType) {
   };
 }
 
+/** Canonical name used by Log Meal and Log Snack. */
+export const estimateStructuredFoodStructured = estimateLoggedMealStructured;
+
 export async function estimateLoggedMeal(description, mealType) {
   try {
-    const structured = await estimateLoggedMealStructured(description, mealType);
+    const structured = await estimateStructuredFoodStructured(description, mealType);
     return { ...structured, fallback: false };
   } catch (err) {
     console.warn(
@@ -130,3 +134,6 @@ export async function estimateLoggedMeal(description, mealType) {
     };
   }
 }
+
+/** Canonical name used by Log Meal and Log Snack. */
+export const estimateStructuredFood = estimateLoggedMeal;

@@ -6,6 +6,12 @@ import { createClient } from '@supabase/supabase-js';
 import { checkAndIncrementUsage } from '../lib/rateLimiter.js';
 import { getRequestUserId } from '../lib/requestUser.js';
 import { OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
+import { dateFromWeekStartingAndDay, getMealsForRange, weekDateRange } from '../lib/mealStore.js';
+import {
+  aggregateStructuredIngredients,
+  leftoverLegacyMealStrings,
+} from '../../shared/lib/aggregateGroceryIngredients.js';
+import { buildGroceryPrompt } from '../lib/groceryPrompt.js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -50,8 +56,29 @@ export default async function handler(req, res) {
 
   try {
     const userId = getRequestUserId(req);
-    const { meals } = req.body;
-    if (!meals || !Array.isArray(meals) || meals.length === 0) {
+    const body = req.body || {};
+    const meals = Array.isArray(body.meals) ? body.meals : [];
+    const weekStarting = String(body.weekStarting || '').trim();
+    const startDateInput = String(body.startDate || '').trim();
+    const endDateInput = String(body.endDate || '').trim();
+    const skipPastDays = body.skipPastDays === true;
+    const localDate = String(body.localDate || '').trim();
+    const completedSlots = Array.isArray(body.completedSlots) ? body.completedSlots : [];
+
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    let rangeStart = DATE_RE.test(startDateInput) ? startDateInput : '';
+    let rangeEnd = DATE_RE.test(endDateInput) ? endDateInput : '';
+    if (weekStarting && DATE_RE.test(weekStarting)) {
+      const week = weekDateRange(weekStarting);
+      if (!rangeStart) rangeStart = week.startDate;
+      if (!rangeEnd) rangeEnd = week.endDate;
+    }
+    if (skipPastDays && DATE_RE.test(localDate) && rangeStart && localDate > rangeStart) {
+      rangeStart = localDate;
+    }
+
+    const useNormalizedRange = Boolean(userId && rangeStart && rangeEnd);
+    if (!useNormalizedRange && meals.length === 0) {
       return res.status(400).json({ success: false, error: 'meals array required' });
     }
 
@@ -66,23 +93,60 @@ export default async function handler(req, res) {
       });
     }
 
-    const prompt = `Extract ingredients from these single-serving meals and produce a consolidated shopping list with no duplicates.
+    let aggregated = [];
+    let legacyMeals = meals.filter((m) => typeof m === 'string' && m.trim());
 
-Meals:
-${meals.join('\n')}
+    if (useNormalizedRange) {
+      const excluded = new Set();
+      for (const slot of completedSlots) {
+        const mealType = String(slot?.mealType || '').trim().toLowerCase();
+        if (!mealType) continue;
+        let date = String(slot?.date || '').trim();
+        if (!DATE_RE.test(date) && weekStarting && slot?.day) {
+          try {
+            date = dateFromWeekStartingAndDay(weekStarting, slot.day);
+          } catch {
+            date = '';
+          }
+        }
+        if (DATE_RE.test(date)) excluded.add(`${date}:${mealType}`);
+      }
 
-Rules:
-- Don't use quantities from the meals; just list items needed.
-- Organize by grocery store sections (e.g., Produce, Meat, Dairy, Pantry, Bakery, Frozen).
-- No explanations, no extra fields.
+      let normalizedMeals;
+      try {
+        normalizedMeals = await getMealsForRange({
+          userId,
+          startDate: rangeStart,
+          endDate: rangeEnd,
+        });
+      } catch (err) {
+        console.error('[generate-grocery-list] failed to load meal_ingredients:', err.message);
+        throw err;
+      }
 
-Return JSON that matches this structure:
-{
-  "list": [
-    { "category": "Produce", "items": ["Apples", "Spinach"] },
-    { "category": "Meat",    "items": ["Chicken breast"] }
-  ]
-}`;
+      const structuredMeals = [];
+      const structuredNames = [];
+      for (const meal of normalizedMeals) {
+        const mealType = String(meal.meal_type || '').toLowerCase();
+        if (mealType === 'snacks') continue;
+        if (excluded.has(`${meal.date}:${mealType}`)) continue;
+        const ingredients = Array.isArray(meal.ingredients) ? meal.ingredients : [];
+        if (ingredients.length === 0) continue;
+        structuredMeals.push(meal);
+        if (meal.meal_name) structuredNames.push(meal.meal_name);
+      }
+
+      aggregated = aggregateStructuredIngredients(
+        structuredMeals.flatMap((meal) => meal.ingredients)
+      );
+      legacyMeals = leftoverLegacyMealStrings(legacyMeals, structuredNames);
+    }
+
+    if (aggregated.length === 0 && legacyMeals.length === 0) {
+      return res.status(400).json({ success: false, error: 'meals array required' });
+    }
+
+    const prompt = buildGroceryPrompt({ aggregated, legacyMeals });
 
     // ── OpenAI ──
     const isGpt5 = String(OPENAI_MEAL_MODEL).toLowerCase().startsWith('gpt-5');
