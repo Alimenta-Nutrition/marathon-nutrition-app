@@ -16,6 +16,7 @@ import {
   getMealsForDay,
   getMealsForRange,
   getMealWithIngredients,
+  getMealById,
   hasValidMealMacros,
   normalizeIngredients,
   saveMeal,
@@ -52,6 +53,16 @@ describe('dateFromWeekStartingAndDay', () => {
 
   it('rejects a non YYYY-MM-DD weekStarting', () => {
     expect(() => dateFromWeekStartingAndDay('08-31-2026', 'thursday')).toThrow(/Invalid weekStarting/);
+  });
+
+  it('does not shift Sunday across a month boundary', () => {
+    expect(dateFromWeekStartingAndDay('2026-02-23', 'monday')).toBe('2026-02-23');
+    expect(dateFromWeekStartingAndDay('2026-02-23', 'sunday')).toBe('2026-03-01');
+  });
+
+  it('does not shift Sunday across a year boundary', () => {
+    expect(dateFromWeekStartingAndDay('2025-12-29', 'monday')).toBe('2025-12-29');
+    expect(dateFromWeekStartingAndDay('2025-12-29', 'sunday')).toBe('2026-01-04');
   });
 });
 
@@ -395,6 +406,13 @@ describe('weekDateRange', () => {
       endDate: '2026-09-06',
     });
   });
+
+  it('returns a year-boundary week as UTC calendar dates', () => {
+    expect(weekDateRange('2025-12-29')).toEqual({
+      startDate: '2025-12-29',
+      endDate: '2026-01-04',
+    });
+  });
 });
 
 describe('deleteMeal helpers', () => {
@@ -559,6 +577,63 @@ describe('getMealWithIngredients', () => {
         mealType: 'lunch',
       })
     ).resolves.toBeNull();
+  });
+});
+
+describe('getMealById', () => {
+  it('returns the mapped meal only when id belongs to the user', async () => {
+    const mealRow = {
+      id: 'meal-1',
+      user_id: 'auth-user-1',
+      date: '2026-09-03',
+      meal_type: 'lunch',
+      slot_index: 0,
+      meal_name: 'Chicken Rice Bowl',
+      calories: 800,
+      protein: 50,
+      carbs: 100,
+      fat: 20,
+      macro_source: 'usda',
+      provider: 'openai',
+      is_user_logged: false,
+      rating: null,
+      verified_by_nutritionist_id: null,
+      verified_at: null,
+      created_at: '2026-09-03T00:00:00Z',
+      updated_at: '2026-09-03T00:00:00Z',
+      meal_ingredients: [
+        {
+          id: 'ing-1',
+          name: 'chicken breast',
+          type: 'protein',
+          grams: 160,
+          calories: 264,
+          protein: 50,
+          carbs: 0,
+          fat: 6,
+          usda_fdc_id: 171077,
+          macro_source: 'usda',
+          sort_order: 0,
+        },
+      ],
+    };
+    const query = createQuery({ data: mealRow, error: null });
+    vi.mocked(supabaseAdmin.from).mockImplementation((table) => {
+      if (table === 'meals') return query;
+      throw new Error(`unexpected table ${table}`);
+    });
+
+    const result = await getMealById({ userId: 'auth-user-1', mealId: 'meal-1' });
+    expect(query.eq).toHaveBeenCalledWith('id', 'meal-1');
+    expect(query.eq).toHaveBeenCalledWith('user_id', 'auth-user-1');
+    expect(result.id).toBe('meal-1');
+    expect(result.ingredients[0].name).toBe('chicken breast');
+  });
+
+  it('returns null when the meal is missing', async () => {
+    const query = createQuery({ data: null, error: null });
+    vi.mocked(supabaseAdmin.from).mockReturnValue(query);
+    await expect(getMealById({ userId: 'auth-user-1', mealId: 'other' })).resolves.toBeNull();
   });
 });
 

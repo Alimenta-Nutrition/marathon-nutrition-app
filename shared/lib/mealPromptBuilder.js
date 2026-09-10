@@ -2,9 +2,7 @@
  * Meal Prompt Builder for Alimenta
  * shared/lib/mealPromptBuilder.js
  *
- * Builds OpenAI prompts for all meal generation flows.
- * The key change from the old prompts: we now include macro targets
- * and ask for structured JSON with ingredients, types, and gram portions.
+ * Builds OpenAI prompts for meal generation flows.
  */
 
 // ─── Ingredient Type Descriptions (for the AI) ──────────────────────────────
@@ -15,7 +13,7 @@ const TYPE_DESCRIPTIONS = `Ingredient types (use exactly these labels):
 - "vegetable": broccoli, spinach, peppers, onions, tomatoes, salad greens, mushrooms
 - "fat": oils, butter, ghee, avocado oil (pure added fats only)`;
 
-/** Shared across all generation prompts — keep meals approachable. */
+/** Shared across day/week prompts — keep meals approachable. */
 const COOKING_SIMPLICITY = `COOKING COMPLEXITY: An average home cook should be able to make these meals easily.
 - Prefer common supermarket ingredients and everyday techniques (grill, bake, sauté, boil, assemble)
 - Avoid overly complicated, multi-step, or restaurant-chef dishes
@@ -31,15 +29,16 @@ const SINGLE_MEAL_FORMAT = `Respond with ONLY valid JSON, no other text:
   ]
 }`;
 
-const DAY_MEALS_FORMAT = `Respond with ONLY valid JSON, no other text:
+const SINGLE_MEAL_JSON = `Return ONLY:
 {
-  "breakfast": {
-    "meal_name": "...",
-    "ingredients": [{ "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }, ...]
-  },
-  "lunch": { "meal_name": "...", "ingredients": [...] },
-  "dinner": { "meal_name": "...", "ingredients": [...] },
-  "dessert": { "meal_name": "...", "ingredients": [...] }
+  "meal_name": "...",
+  "ingredients": [
+    {
+      "name": "...",
+      "type": "protein|carb|vegetable|fat",
+      "grams": 0
+    }
+  ]
 }`;
 
 const WEEK_MEALS_FORMAT = `Respond with ONLY valid JSON, no other text:
@@ -54,36 +53,84 @@ const WEEK_MEALS_FORMAT = `Respond with ONLY valid JSON, no other text:
   ... (all 7 days)
 }`;
 
+const MEAL_TYPE_ROLES = {
+  breakfast: 'Make it recognizably breakfast food. A vegetable is not required.',
+  lunch: 'Make it a substantial midday meal.',
+  dinner: 'Make it a substantial evening entrée with a coherent combination of foods.',
+  dessert: 'Make it a sweet dessert, not a savory meal.',
+  snack: 'Make it a simple snack, not a full meal.',
+};
+
+const SHARED_GENERATION_RULES = `RULES
+- Use common foods and simple preparation.
+- Keep the ingredient list reasonably short.
+- Portions should look like something one person would actually eat.
+- Do not compensate for a poor ingredient choice by making another ingredient unusually large or small.
+- Use only these ingredient types: protein, carb, vegetable, fat.
+- Return cooked gram weights.
+- Meal name should be short, natural, and appetizing.`;
+
 // ─── Shared Blocks ───────────────────────────────────────────────────────────
 
-function buildPreferencesBlock({ foodPreferences, dietaryRestrictions }) {
-  const likes = foodPreferences?.likes || foodPreferences?.cuisine_favorites
-    ? [foodPreferences.likes, foodPreferences.cuisine_favorites].filter(Boolean).join(', ')
-    : null;
-  const dislikes = foodPreferences?.dislikes || null;
+function likedFoodsAndCuisines(foodPreferences) {
+  return [foodPreferences?.likes, foodPreferences?.cuisine_favorites, foodPreferences?.cuisines]
+    .filter(Boolean)
+    .join(', ');
+}
 
-  let block = '';
-  if (dietaryRestrictions) {
-    block += `DIETARY RESTRICTIONS (MUST follow): ${dietaryRestrictions}\n`;
+function buildTargetsBlock(budget, { perServing = false } = {}) {
+  if (!budget) return '';
+  const heading = perServing ? 'PER-SERVING TARGETS' : 'TARGETS';
+  return [
+    heading,
+    `~${budget.calories} kcal`,
+    `~${budget.protein}g protein`,
+    `~${budget.carbs}g carbs`,
+    `~${budget.fat}g fat`,
+    '',
+  ].join('\n');
+}
+
+function buildPriorities(mealType) {
+  const dish = mealType || 'meal';
+  return [
+    'Priorities, in order:',
+    `1. Create a normal, appetizing ${dish} that makes culinary sense.`,
+    '2. Choose foods whose natural macro profiles fit the targets well.',
+    '3. Use realistic serving sizes.',
+    '4. Aim for within 5% of the targets, but allow up to ~10% rather than using strange portions or combinations.',
+    '',
+  ].join('\n');
+}
+
+function buildUsdaOrPortionLine(useUsda) {
+  if (useUsda) {
+    return 'Use `lookup_nutrition` for the ingredients you choose, then set realistic COOKED gram amounts using the returned USDA nutrition data.\n';
   }
-  if (likes) {
-    block += `FOODS/CUISINES THE USER ENJOYS (draw from these but DO NOT repeat the same ones across meals — rotate through them): ${likes}\n`;
-  }
+  return 'Set realistic COOKED gram amounts for the ingredients you choose.\n';
+}
+
+function buildPreferencesBlock({ foodPreferences, dietaryRestrictions }) {
+  const likes = likedFoodsAndCuisines(foodPreferences);
+  const dislikes = foodPreferences?.dislikes || '';
+  const lines = ['PREFERENCES', `Enjoys: ${likes || 'not specified'}`];
   if (dislikes) {
-    block += `DISLIKED FOODS (NEVER use): ${dislikes}\n`;
+    lines.push(`Never use: ${dislikes}`);
   }
-  return block || 'No specific preferences.\n';
+  if (dietaryRestrictions) {
+    lines.push(`Dietary restrictions (must follow): ${dietaryRestrictions}`);
+  }
+  lines.push('');
+  return lines.join('\n');
 }
 
 function buildTrainingBlock({ todayTraining, tomorrowTraining }) {
-  let block = '';
-  if (todayTraining) {
-    block += `TODAY'S TRAINING: ${todayTraining}\n`;
-  }
-  if (tomorrowTraining) {
-    block += `TOMORROW'S TRAINING: ${tomorrowTraining}\n`;
-  }
-  return block || 'REST DAY\n';
+  return [
+    'TRAINING',
+    `Today: ${todayTraining || 'Rest'}`,
+    `Tomorrow: ${tomorrowTraining || 'Rest'}`,
+    '',
+  ].join('\n');
 }
 
 function formatTrainingDay(workouts) {
@@ -97,72 +144,26 @@ function formatTrainingDay(workouts) {
     .join(' + ');
 }
 
-function buildVarietyBlock({ avoidIngredients, alreadyGeneratedToday, ragContext }) {
-  let block = '';
-  if (avoidIngredients?.length) {
-    block += `DO NOT USE these ingredients (already used in other meals today): ${avoidIngredients.join(', ')}\n`;
-    block += `Pick a DIFFERENT protein source, a DIFFERENT carb, and a DIFFERENT vegetable.\n`;
-  }
-  if (alreadyGeneratedToday?.length) {
-    block += `Meals already created today: ${alreadyGeneratedToday.join('; ')}\n`;
-    block += `You MUST use completely different main ingredients from those meals.\n`;
-  }
+function buildVarietyBlock({ alreadyGeneratedToday, ragContext } = {}) {
+  const existing = (alreadyGeneratedToday || []).filter(Boolean);
+  const lines = [
+    'VARIETY',
+    `Meals already eaten today: ${existing.length ? existing.join('; ') : 'none'}`,
+    'Avoid making essentially the same meal again. Prefer a different primary protein when reasonable, but staples may repeat. Never sacrifice meal quality or macro fit just for variety.',
+  ];
   if (ragContext) {
-    block += `\nPERSONALIZATION CONTEXT:\n${ragContext}\n`;
+    lines.push(String(ragContext));
   }
-  return block;
+  lines.push('');
+  return lines.join('\n');
 }
 
 /**
- * Tool + portion instructions when generation uses lookup_nutrition.
- * @param {{ calories: number, protein: number, carbs: number, fat: number }} budget
+ * Tool instruction when generation uses lookup_nutrition.
+ * Budget is accepted for call-site compatibility; targets live in TARGETS / priorities.
  */
-export function buildUsdaToolInstructions(budget) {
-  const calories = budget?.calories ?? 0;
-  const protein = budget?.protein ?? 0;
-  const carbs = budget?.carbs ?? 0;
-  const fat = budget?.fat ?? 0;
-
-  return `You have access to a lookup_nutrition tool. After choosing ingredients, call it with cooked, single-ingredient names (e.g. "chicken breast cooked", "white rice cooked") to get USDA macros per 100g. Use those values to set gram amounts.
-
-Stay within 5% of these targets: ${calories} cal, ${protein}g protein, ${carbs}g carbs, ${fat}g fat.
-
-PORTION GUARDRAILS — prefer a realistic plate over perfect math:
-- Protein foods: 120–250g cooked
-- Carb foods: 150–300g cooked; if carb target > 80g, include 2+ carb ingredients
-- Vegetables: 80–200g
-- Added fats: 5–20g
-Do not use huge single portions (e.g. 550g rice) to hit macros.
-
-JSON format: { "meal_name": "...", "ingredients": [{ "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }] }`;
-}
-
-function buildMacroBudgetBlock(budget, useUsda = false) {
-  if (!budget) return '';
-  if (useUsda) {
-    return `MACRO TARGETS for this meal:
-- Calories: ~${budget.calories} kcal
-- Protein: ~${budget.protein}g
-- Carbs: ~${budget.carbs}g
-- Fat: ~${budget.fat}g
-
-${buildUsdaToolInstructions(budget)}\n`;
-  }
-  return `MACRO TARGETS for this meal:
-- Calories: ~${budget.calories} kcal
-- Protein: ~${budget.protein}g
-- Carbs: ~${budget.carbs}g
-- Fat: ~${budget.fat}g
-
-IMPORTANT: Choose ingredient gram amounts that will approximately hit these targets.
-Use COOKED weights for carbs (rice, pasta, potatoes). A rough guide:
-- 1g of protein-type food ≈ 0.25g protein, 0.10g fat
-- 1g of cooked carb-type food ≈ 0.23g carbs
-- 1g of vegetable ≈ 0.06g carbs
-- 1g of added fat (oil/butter) ≈ 1.0g fat
-So for ${budget.protein}g protein, you need ~${Math.round(budget.protein / 0.25)}g of protein food.
-For ${budget.carbs}g carbs, you need ~${Math.round(budget.carbs / 0.23)}g of cooked carb food.
-For ${budget.fat}g fat (after accounting for fat in protein), you may need ~${Math.max(0, Math.round((budget.fat - budget.protein * 0.4) / 1.0))}g of added fat.\n`;
+export function buildUsdaToolInstructions(_budget) {
+  return 'Use `lookup_nutrition` for the ingredients you choose, then set realistic COOKED gram amounts using the returned USDA nutrition data.';
 }
 
 /**
@@ -174,53 +175,15 @@ function buildMealTypeGuidance(mealType) {
     .toLowerCase()
     .trim();
   const normalized = key === 'snacks' ? 'snack' : key;
+  const body = MEAL_TYPE_ROLES[normalized] || `Create a realistic, appetizing ${mealType || 'meal'}.`;
+  return `MEAL TYPE\n${body}\n`;
+}
 
-  const guidance = {
-    breakfast: {
-      role: 'BREAKFAST',
-      body: `This is BREAKFAST — a morning meal, not lunch or dinner.
-- Typical forms: eggs, oatmeal, yogurt bowl, toast, smoothie, overnight oats, breakfast burrito
-- Avoid dinner-style plates (rice bowls, pasta, steak dinners, heavy stir-fries)
-- Keep it something someone would reasonably eat before noon
-Example name style: "Greek yogurt with berries and honey" or "Scrambled eggs on toast"`,
-    },
-    lunch: {
-      role: 'LUNCH',
-      body: `This is LUNCH — a midday plated meal.
-- Full meal is fine: bowl, wrap, sandwich, salad with protein, grain plate
-- Should feel distinct from a light snack
-Example name style: "Chicken quinoa bowl with roasted vegetables"`,
-    },
-    dinner: {
-      role: 'DINNER',
-      body: `This is DINNER — an evening entrée.
-- Full plated meal: protein + carb + vegetable is appropriate
-Example name style: "Grilled salmon with rice and broccoli"`,
-    },
-    snack: {
-      role: 'SNACK',
-      body: `This is a SNACK — NOT a mini lunch or dinner.
-- Keep it simple: typically 1–3 ingredients, quick to eat, portable when possible
-- Good examples: Greek yogurt, cottage cheese + fruit, protein shake, apple + peanut butter, jerky, toast with avocado, handful of nuts, cheese + crackers
-- DO NOT generate bowls, rice plates, pasta, stir-fries, burrito bowls, or other entrée-style dishes
-- If macros are high, scale a snack format (e.g. larger yogurt parfait) — do not invent a meal
-Example name style: "Cottage cheese with pineapple" or "Peanut butter banana toast"`,
-    },
-    dessert: {
-      role: 'DESSERT',
-      body: `This is DESSERT — a sweet treat after meals, not a savory entrée or snack plate.
-- Real dessert forms: cake, cookie, brownie, pudding, ice cream, fruit crisp, dark chocolate, mousse
-- DO NOT generate smoothie bowls, yogurt bowls, rice bowls, or savory dishes
-Example name style: "Dark chocolate banana soft-serve" or "Berry crisp"`,
-    },
-  };
-
-  const match = guidance[normalized];
-  if (!match) {
-    return `MEAL ROLE: Create a realistic, appetizing ${mealType || 'meal'}.\n`;
-  }
-
-  return `MEAL ROLE (${match.role}):\n${match.body}\n`;
+function compactPrompt(lines) {
+  return lines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 // ─── Prompt Builders ─────────────────────────────────────────────────────────
@@ -237,44 +200,36 @@ export function buildSingleMealPrompt({
   dietaryRestrictions = '',
   todayTraining = null,
   tomorrowTraining = null,
-  avoidIngredients = [],
   alreadyGeneratedToday = [],
   ragContext = null,
   reason = null,        // for regeneration: user's feedback
   currentMeal = null,   // for regeneration: meal being replaced
   useUsda = false,
-}) {
+} = {}) {
   const lines = [
-    `You are a sports nutritionist creating a ${mealType} for an athlete.`,
+    `You are creating a realistic ${mealType} for an athlete.`,
     '',
+    buildTargetsBlock(macroBudget),
+    buildUsdaOrPortionLine(useUsda),
+    buildPriorities(mealType),
     buildMealTypeGuidance(mealType),
-    buildMacroBudgetBlock(macroBudget, useUsda),
     buildPreferencesBlock({ foodPreferences, dietaryRestrictions }),
+    buildVarietyBlock({ alreadyGeneratedToday, ragContext }),
     buildTrainingBlock({ todayTraining, tomorrowTraining }),
-    buildVarietyBlock({ avoidIngredients, alreadyGeneratedToday, ragContext }),
   ];
 
   if (reason && currentMeal) {
     lines.push(`USER FEEDBACK: "${reason}"`);
     lines.push(`MEAL TO REPLACE: ${currentMeal}`);
-    lines.push('Generate a new meal addressing this feedback.\n');
+    lines.push('Generate a new meal addressing this feedback.');
+    lines.push('');
   }
 
-  lines.push(`RULES:`);
-  lines.push(`1. Return ingredients with COOKED gram weights`);
-  lines.push(`2. Every ingredient must have a type: protein, carb, vegetable, or fat`);
-  lines.push(`3. Follow the MEAL ROLE guidance above — the dish format must match this meal type`);
-  lines.push(`4. Meal name should be short and descriptive`);
-  lines.push(`5. Do not state the cuisine name, just the meal name.`);
-  lines.push(`6. Keep meals easy for an average home cook — nothing overly complicated`);
+  lines.push(SHARED_GENERATION_RULES);
   lines.push('');
-  lines.push(COOKING_SIMPLICITY);
-  lines.push('');
-  lines.push(TYPE_DESCRIPTIONS);
-  lines.push('');
-  lines.push(SINGLE_MEAL_FORMAT);
+  lines.push(SINGLE_MEAL_JSON);
 
-  return lines.join('\n');
+  return compactPrompt(lines);
 }
 
 /**
@@ -295,7 +250,7 @@ export function buildDayPrompt({
 }) {
   const mealsToGenerate = Object.keys(mealBudgets);
   const numMeals = mealsToGenerate.length;
-  
+
   const budgetSummary = Object.entries(mealBudgets)
     .map(([meal, b]) => `  ${meal}: ${b.calories} kcal | ${b.protein}P ${b.carbs}C ${b.fat}F`)
     .join('\n');
@@ -364,7 +319,7 @@ export function buildDayPrompt({
     .map(m => `  "${m}": { "meal_name": "...", "ingredients": [{ "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }, ...] }`)
     .join(',\n');
   const dynamicFormat = `Respond with ONLY valid JSON, no other text:\n{\n${formatEntries}\n}`;
-  
+
   lines.push(dynamicFormat);
 
   return lines.join('\n');
@@ -452,7 +407,8 @@ export function buildWeekPrompt({
  * Build a prompt for parsing a user-entered meal description into
  * structured ingredients with types and estimated grams.
  *
- * Used by: Log Meal /api/estimate-macros (OpenAI extraction only — no macros).
+ * Used by: Log Meal and Log Snack via /api/estimate-macros
+ * (OpenAI extraction only — no macros).
  */
 export function buildParseMealPrompt({ mealDescription, mealType } = {}) {
   const slot = mealType ? `This is a ${mealType} the user already ate.\n` : '';
@@ -493,45 +449,44 @@ export function buildMealPrepPrompt({
   mealType,
   macroBudget,
   numServings = 5,
+  optionCount = 4,
   foodPreferences = {},
   dietaryRestrictions = '',
-}) {
+  useUsda = false,
+} = {}) {
   const lines = [
-    `You are a sports nutritionist creating a meal prep recipe for ${numServings} servings of ${mealType}.`,
+    `You are creating ${optionCount} realistic ${mealType} meal-prep options for an athlete.`,
+    `Each option should make ${numServings} servings.`,
     '',
-    `PER-SERVING MACRO TARGETS:`,
-    `- Calories: ~${macroBudget.calories} kcal`,
-    `- Protein: ~${macroBudget.protein}g`,
-    `- Carbs: ~${macroBudget.carbs}g`,
-    `- Fat: ~${macroBudget.fat}g`,
-    '',
+    buildTargetsBlock(macroBudget, { perServing: true }),
+    buildUsdaOrPortionLine(useUsda),
+    buildPriorities(mealType),
+    buildMealTypeGuidance(mealType),
     buildPreferencesBlock({ foodPreferences, dietaryRestrictions }),
-    'RULES:',
-    '1. Recipe should be easy to batch cook and store for the week',
-    '2. Ingredients should reheat well',
-    '3. Return PER-SERVING ingredient amounts',
-    '4. Suggest 2-3 different options',
-    '5. Keep recipes easy for an average home cook — nothing overly complicated',
+    'VARIETY',
+    'Avoid making the options essentially the same meal. Prefer a different primary protein when reasonable, but staples may repeat. Never sacrifice meal quality or macro fit just for variety.',
     '',
-    COOKING_SIMPLICITY,
+    SHARED_GENERATION_RULES,
+    '- Ingredient grams are PER-SERVING cooked weights.',
+    '- Recipes should be easy to batch cook and reheat.',
     '',
-    TYPE_DESCRIPTIONS,
-    '',
-    `Respond with ONLY valid JSON:`,
-    `{`,
-    `  "options": [`,
-    `    {`,
-    `      "meal_name": "...",`,
-    `      "ingredients": [{ "name": "...", "type": "...", "grams": 0 }, ...]`,
-    `    },`,
-    `    ...`,
-    `  ]`,
-    `}`,
+    'Return ONLY:',
+    '{',
+    '  "options": [',
+    '    {',
+    '      "meal_name": "...",',
+    '      "description": "Brief description of the dish",',
+    '      "prep_time": "30 mins",',
+    '      "prep_reason": "Why this is good for meal prep",',
+    '      "ingredients": [',
+    '        { "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }',
+    '      ]',
+    '    }',
+    '  ]',
+    '}',
   ];
 
-  return lines.join('\n');
+  return compactPrompt(lines);
 }
 
-// ─── Helpers for callers ─────────────────────────────────────────────────────
-
-export { formatTrainingDay };
+export { formatTrainingDay, SHARED_GENERATION_RULES };

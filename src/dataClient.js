@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient';
+import { buildSavedMealRow, isUnknownColumnError } from '../../shared/lib/savedMealStructure';
 
 // ================================================
 // Helpers
@@ -437,23 +438,28 @@ export async function fetchSavedMealsByType(userId, mealType) {
 export async function saveMeal(userId, mealData) {
   console.log('💾 Saving meal:', { userId, mealData });
 
-  // Extract macros from description if present
-  const macros = extractMacrosFromDescription(mealData.fullDescription || '');
+  const structuredRow = buildSavedMealRow(userId, mealData, {
+    includeStructure: true,
+    includeTimesUsed: false,
+  });
+  const baseRow = buildSavedMealRow(userId, mealData, {
+    includeStructure: false,
+    includeTimesUsed: false,
+  });
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from('saved_meals')
-    .insert({
-      user_id: userId,
-      meal_type: mealData.mealType,
-      name: mealData.name,
-      full_description: mealData.fullDescription,
-      calories: macros.calories || null,
-      protein: macros.protein || null,
-      carbs: macros.carbs || null,
-      fat: macros.fat || null,
-    })
+    .insert(structuredRow)
     .select()
     .single();
+
+  if (error && isUnknownColumnError(error)) {
+    ({ data, error } = await supabase
+      .from('saved_meals')
+      .insert(baseRow)
+      .select()
+      .single());
+  }
 
   if (error) {
     console.error('❌ Save meal error:', error);

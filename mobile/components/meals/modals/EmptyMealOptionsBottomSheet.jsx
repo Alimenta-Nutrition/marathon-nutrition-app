@@ -8,7 +8,7 @@ import {
   Modal,
   useWindowDimensions,
 } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../../context/ThemeContext';
 import { TourTarget } from '../../tour/TourTarget';
 import { useProductTour } from '../../../context/ProductTourContext';
@@ -167,8 +167,8 @@ export function EmptyMealOptionsBottomSheet({
           ]}
           onPress={onGenerate}
         >
-          <Ionicons
-            name="color-wand-outline"
+          <MaterialCommunityIcons
+            name="chef-hat"
             size={22}
             color={!canGenerate ? colors.textTertiary : colors.primary}
           />

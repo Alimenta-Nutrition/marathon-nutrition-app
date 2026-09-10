@@ -8,7 +8,6 @@ import {
   Share,
   StyleSheet,
   TouchableOpacity,
-  Platform,
   ScrollView,
   Dimensions,
 } from 'react-native';
@@ -23,7 +22,7 @@ import { useMealPlan } from '../../hooks/useMealPlan';
 import { useWorkoutLog } from '../../hooks/useWorkoutLog';
 import { useUserProfile } from '../../hooks/useUserProfile';
 import { useMealCompletions, getCurrentDayOfWeek, getTodayDate } from '../../hooks/useMealCompletions';
-import { saveMeal, recordStreakActivity } from '../../../shared/lib/dataClient';
+import { saveMeal, deleteSavedMeal, fetchSavedMeals, recordStreakActivity } from '../../../shared/lib/dataClient';
 import { apiClient } from '../../../shared/services/api';
 import { formatMealString } from '../../../shared/lib/rebalanceDayMacros';
 
@@ -37,8 +36,8 @@ import { RecipeModal } from '../../components/meals/modals/RecipeModal';
 import { GroceryListModal } from '../../components/meals/modals/GroceryListModal';
 import { RegenerateReasonModal } from '../../components/meals/modals/RegenerateReasonModal';
 import { MealOptionsBottomSheet } from '../../components/meals/modals/MealOptionsBottomSheet';
-import { CopyMealModal } from '../../components/meals/modals/CopyMealModal';
 import { EmptyMealOptionsBottomSheet } from '../../components/meals/modals/EmptyMealOptionsBottomSheet';
+import { AiPromptModal } from '../../components/meals/modals/AiPromptModal';
 import { AnalyticsModal } from '../../components/meals/modals/AnalyticsModal';
 import { MealPrepModal } from '../../components/meals/modals/MealPrepModal';
 import { LogMealModal } from '../../components/meals/modals/LogMealModal';
@@ -77,6 +76,22 @@ const { width } = Dimensions.get('window');
 const OFFLINE_ALERT = () =>
   Alert.alert('No Connection', 'Please check your internet connection and try again.');
 
+function mealSaveName(mealName, mealDescription) {
+  const fromName = String(mealName || '').replace(/\s*\(Cal:[^)]+\)\s*$/i, '').trim();
+  if (fromName) return fromName;
+  return String(mealDescription || '').replace(/\s*\(Cal:[^)]+\)\s*$/i, '').trim();
+}
+
+function findSavedMeal(savedMeals, mealType, mealName, mealDescription) {
+  const name = mealSaveName(mealName, mealDescription).toLowerCase();
+  if (!name || !mealType) return null;
+  return (
+    savedMeals.find(
+      (m) => m.meal_type === mealType && String(m.name || '').trim().toLowerCase() === name
+    ) || null
+  );
+}
+
 export default function MealsScreen() {
   const posthog = usePostHog();
   const router = useRouter();
@@ -97,12 +112,12 @@ export default function MealsScreen() {
 
   // Modal states
   const [showMealOptions, setShowMealOptions] = useState(false);
-  const [showCopyMealModal, setShowCopyMealModal] = useState(false);
   const [showEmptyMealOptions, setShowEmptyMealOptions] = useState(false);
   const [emptyMealType, setEmptyMealType] = useState(null);
   const [selectedMeal, setSelectedMeal] = useState(null);
   const [showRecipeModal, setShowRecipeModal] = useState(false);
   const [recipe, setRecipe] = useState('');
+  const [recipePrompt, setRecipePrompt] = useState(null);
   const [loadingRecipe, setLoadingRecipe] = useState(false);
   const [showGroceryModal, setShowGroceryModal] = useState(false);
   const [groceryList, setGroceryList] = useState([]);
@@ -119,10 +134,11 @@ export default function MealsScreen() {
   const [showLogSnackModal, setShowLogSnackModal] = useState(false);
   const [logSnackSubmitting, setLogSnackSubmitting] = useState(false);
   const [showServingsPicker, setShowServingsPicker] = useState(false);
+  const [favoriteMeals, setFavoriteMeals] = useState([]);
 
-  // Debug prompt display
-  const [debugPrompt, setDebugPrompt] = useState(null);
-  const [showDebugPrompt, setShowDebugPrompt] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState(null);
+  const [showAiPrompt, setShowAiPrompt] = useState(false);
+  const [aiPromptLoading, setAiPromptLoading] = useState(false);
 
   const mealPlanHook = useMealPlan(user, isGuest);
   const workoutLogHook = useWorkoutLog(user, isGuest);
@@ -132,9 +148,28 @@ export default function MealsScreen() {
     loadWeek: loadWorkoutWeek,
   } = workoutLogHook;
   const profileHook = useUserProfile(user, isGuest);
-  const { clearMeal, clearDay, clearAllMeals, copyMeal, setDayMealToggles } = mealPlanHook;
+  const { clearMeal, clearDay, setDayMealToggles } = mealPlanHook;
   const mealCompletionsHook = useMealCompletions(user, isGuest);
   const { canDo, remaining, refetch: refetchLimits } = useUsageLimits(user, isGuest);
+
+  useEffect(() => {
+    if (!user?.id || isGuest) {
+      setFavoriteMeals([]);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchSavedMeals(user.id)
+      .then((meals) => {
+        if (!cancelled) setFavoriteMeals(Array.isArray(meals) ? meals : []);
+      })
+      .catch((err) => {
+        console.error('Failed to load saved meals:', err);
+        if (!cancelled) setFavoriteMeals([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, isGuest, isFocused]);
 
   const userProfile =
     profileHook.rawUserProfile ||
@@ -303,6 +338,35 @@ export default function MealsScreen() {
       return;
     }
     const { workouts, tomorrowWorkouts } = await resolveWorkoutsForMealDay(selectedDay);
+    if (!waitingForTourMeal) {
+      setAiPrompt(null);
+      setAiPromptLoading(true);
+      setShowAiPrompt(true);
+      apiClient
+        .previewSingleMealPrompt({
+          userId: user?.id,
+          day: selectedDay,
+          mealType,
+          userProfile,
+          foodPreferences,
+          workouts: Array.isArray(workouts) ? workouts : [],
+          tomorrowWorkouts: Array.isArray(tomorrowWorkouts) ? tomorrowWorkouts : [],
+          weekStarting: mealPlanHook.currentWeekStarting,
+          existingMeals: mealPlanHook.mealPlan,
+          ...mealPlanHook.getDayTogglePayload(selectedDay),
+        })
+        .then((result) => {
+          if (result?.success && result.prompt) {
+            setAiPrompt(result.prompt);
+          } else {
+            setAiPrompt(result?.error || 'Could not load the prompt that was sent.');
+          }
+        })
+        .catch((err) => {
+          setAiPrompt(err?.message || 'Could not load the prompt that was sent.');
+        })
+        .finally(() => setAiPromptLoading(false));
+    }
     await mealPlanHook.generateSingleMeal(
       selectedDay,
       mealType,
@@ -345,21 +409,26 @@ export default function MealsScreen() {
 
     setShowServingsPicker(false);
     setLoadingRecipe(true);
+    setRecipe('');
+    setRecipePrompt(null);
     setShowRecipeModal(true); // Open modal immediately
 
     try {
       const mealDescription = mealPlanHook.mealPlan?.[selectedDay]?.[selectedMeal.mealType];
+      const mealV2 = mealPlanHook.mealPlan?.[selectedDay]?.[`${selectedMeal.mealType}_v2`];
       const parsed = parseMeal(mealDescription);
       const result = await apiClient.getRecipe({
         userId: user?.id,
         meal: mealDescription,
         description: selectedMeal.name || parsed.name || '',
         mealType: selectedMeal.mealType,
+        mealId: mealV2?.id || undefined,
+        weekStarting: mealPlanHook.currentWeekStarting,
         macros: {
-          calories: selectedMeal.calories ?? parsed.calories ?? 0,
-          protein: selectedMeal.protein ?? parsed.protein ?? 0,
-          carbs: selectedMeal.carbs ?? parsed.carbs ?? 0,
-          fat: selectedMeal.fat ?? parsed.fat ?? 0,
+          calories: mealV2?.macros?.calories ?? selectedMeal.calories ?? parsed.calories ?? 0,
+          protein: mealV2?.macros?.protein ?? selectedMeal.protein ?? parsed.protein ?? 0,
+          carbs: mealV2?.macros?.carbs ?? selectedMeal.carbs ?? parsed.carbs ?? 0,
+          fat: mealV2?.macros?.fat ?? selectedMeal.fat ?? parsed.fat ?? 0,
         },
         day: selectedDay,
         servings: servings,
@@ -370,6 +439,7 @@ export default function MealsScreen() {
 
       if (result.success) {
         setRecipe(result.recipe || '');
+        setRecipePrompt(result.prompt || null);
         refetchLimits();
         capture(posthog, 'recipe_viewed', { meal_type: selectedMeal.mealType });
       } else {
@@ -399,25 +469,55 @@ export default function MealsScreen() {
       return;
     }
 
-    const name = selectedMeal.name || parseMeal(fullMealString).name || 'Meal';
+    const name = mealSaveName(selectedMeal.name, parseMeal(fullMealString).name) || 'Meal';
+    const existing = findSavedMeal(
+      favoriteMeals,
+      selectedMeal.mealType,
+      selectedMeal.name,
+      fullMealString
+    );
 
     setSavingMeal(true);
     try {
-      const { error } = await saveMeal(user.id, {
+      if (existing?.id) {
+        const { error } = await deleteSavedMeal(user.id, existing.id);
+        setShowMealOptions(false);
+        if (error) {
+          console.error('Unsave meal error:', error);
+          Alert.alert('Error', "Couldn't unsave this meal. Please try again.");
+          return;
+        }
+        setFavoriteMeals((prev) => prev.filter((m) => m.id !== existing.id));
+        return;
+      }
+
+      const { data, error } = await saveMeal(user.id, {
         name,
         fullDescription: fullMealString,
         mealType: selectedMeal.mealType,
+        ingredients: mealPlanHook.mealPlan?.[selectedDay]?.[`${selectedMeal.mealType}_v2`]?.ingredients,
+        macros: mealPlanHook.mealPlan?.[selectedDay]?.[`${selectedMeal.mealType}_v2`]?.macros,
+        macroSource: mealPlanHook.mealPlan?.[selectedDay]?.[`${selectedMeal.mealType}_v2`]?.macro_source,
+        provider: mealPlanHook.mealPlan?.[selectedDay]?.[`${selectedMeal.mealType}_v2`]?.provider,
       });
       setShowMealOptions(false);
       if (error) {
         console.error('Save meal error:', error);
         Alert.alert('Error', "Couldn't save this meal. Please try again.");
-      } else {
-        Alert.alert('Success', 'Meal saved!');
+        return;
       }
+      if (data) {
+        setFavoriteMeals((prev) => [data, ...prev]);
+      }
+      Alert.alert('Success', 'Meal saved!');
     } catch (err) {
       console.error('Save meal error:', err);
-      Alert.alert('Error', "Couldn't save this meal. Please try again.");
+      Alert.alert(
+        'Error',
+        existing?.id
+          ? "Couldn't unsave this meal. Please try again."
+          : "Couldn't save this meal. Please try again."
+      );
     } finally {
       setSavingMeal(false);
     }
@@ -499,21 +599,10 @@ export default function MealsScreen() {
     );
   };
 
-  const handleCopyMeal = () => {
-    setShowMealOptions(false);
-    if (selectedMeal?.mealType === 'snacks') return;
-    setShowCopyMealModal(true);
-  };
-
-  const handleConfirmCopyMeal = async (destinationDays) => {
-    if (!selectedMeal?.mealType) return { success: false, error: 'No meal selected' };
-    return copyMeal(selectedDay, selectedMeal.mealType, destinationDays);
-  };
-
   const handleClearSelectedDay = () => {
     Alert.alert(
       'Clear day',
-      `Clear all meals for ${selectedDay}?`,
+      `Clear all meals for ${capitalize(selectedDay)}?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -523,26 +612,6 @@ export default function MealsScreen() {
             const result = await clearDay(selectedDay);
             if (!result?.success) {
               Alert.alert('Could not clear day', result?.error || 'Failed to clear day');
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const handleClearDisplayedWeek = () => {
-    Alert.alert(
-      'Clear week',
-      'Clear all meals in the displayed week?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear',
-          style: 'destructive',
-          onPress: async () => {
-            const result = await clearAllMeals();
-            if (!result?.success) {
-              Alert.alert('Could not clear week', result?.error || 'Failed to clear week');
             }
           },
         },
@@ -566,13 +635,16 @@ export default function MealsScreen() {
     setShowEditMealModal(true);
   };
 
-  const handleSaveEditedMeal = async ({ name, macros }) => {
+  const handleSaveEditedMeal = ({ name, macros }) => {
     if (!selectedMeal?.mealType) return;
     const mealType = selectedMeal.mealType;
     const trimmed = String(name || '').trim();
     if (!trimmed) return;
 
-    const existingV2 = mealPlanHook.mealPlan?.[selectedDay]?.[`${mealType}_v2`];
+    const existingDay = mealPlanHook.mealPlan?.[selectedDay];
+    const existingV2 = existingDay?.[`${mealType}_v2`];
+    const previousDescription = existingDay?.[mealType];
+    const previousV2 = existingV2 && typeof existingV2 === 'object' ? existingV2 : null;
     const existingIngredients = Array.isArray(existingV2?.ingredients)
       ? existingV2.ingredients
       : [];
@@ -586,43 +658,14 @@ export default function MealsScreen() {
       (key) => Number(macros[key]) !== Number(prevMacros[key])
     );
     const nameChanged = trimmed !== String(selectedMeal.name || '').trim();
+    const shouldPersist = !isGuest && (macrosChanged || nameChanged);
 
-    if (!isGuest && (macrosChanged || nameChanged)) {
-      if (!mealPlanHook.currentWeekStarting) {
-        Alert.alert(
-          'Could not save meal',
-          'Missing week starting date. Please close and try again.'
-        );
-        return;
-      }
-      try {
-        const result = macrosChanged
-          ? await apiClient.patchMeal({
-              action: 'macros',
-              day: selectedDay,
-              mealType,
-              weekStarting: mealPlanHook.currentWeekStarting,
-              mealName: trimmed,
-              calories: macros.calories,
-              protein: macros.protein,
-              carbs: macros.carbs,
-              fat: macros.fat,
-              macroSource: 'user_entered',
-            })
-          : await apiClient.patchMeal({
-              action: 'rename',
-              day: selectedDay,
-              mealType,
-              weekStarting: mealPlanHook.currentWeekStarting,
-              mealName: trimmed,
-            });
-        if (!result?.success) {
-          throw new Error(result?.error || 'Failed to save meal');
-        }
-      } catch (err) {
-        Alert.alert('Could not save meal', err.message || 'Failed to save meal');
-        return;
-      }
+    if (shouldPersist && !mealPlanHook.currentWeekStarting) {
+      Alert.alert(
+        'Could not save meal',
+        'Missing week starting date. Please close and try again.'
+      );
+      return;
     }
 
     const mealDescription = formatMealString(trimmed, macros);
@@ -637,9 +680,57 @@ export default function MealsScreen() {
       ingredients: existingIngredients,
     });
     setShowEditMealModal(false);
+
+    if (!shouldPersist) return;
+
+    const weekStarting = mealPlanHook.currentWeekStarting;
+    void (async () => {
+      try {
+        const result = macrosChanged
+          ? await apiClient.patchMeal({
+              action: 'macros',
+              day: selectedDay,
+              mealType,
+              weekStarting,
+              mealName: trimmed,
+              calories: macros.calories,
+              protein: macros.protein,
+              carbs: macros.carbs,
+              fat: macros.fat,
+              macroSource: 'user_entered',
+            })
+          : await apiClient.patchMeal({
+              action: 'rename',
+              day: selectedDay,
+              mealType,
+              weekStarting,
+              mealName: trimmed,
+            });
+        if (!result?.success) {
+          throw new Error(result?.error || 'Failed to save meal');
+        }
+      } catch (err) {
+        mealPlanHook.updateMeal(
+          selectedDay,
+          mealType,
+          previousDescription,
+          previousV2 || {}
+        );
+        Alert.alert('Could not save meal', err.message || 'Failed to save meal');
+      }
+    })();
   };
 
-  const handleLogSnack = async ({ day, name, calories, protein, carbs, fat }) => {
+  const handleLogSnack = async ({
+    day,
+    name,
+    calories,
+    protein,
+    carbs,
+    fat,
+    ingredients,
+    macroSource,
+  }) => {
     if (!user || isGuest) {
       Alert.alert('Sign in required', 'Log in to save snacks.');
       return;
@@ -648,7 +739,6 @@ export default function MealsScreen() {
       OFFLINE_ALERT();
       return;
     }
-    setShowLogSnackModal(false);
     try {
       setLogSnackSubmitting(true);
       const result = await apiClient.logSnack({
@@ -660,11 +750,14 @@ export default function MealsScreen() {
         protein,
         carbs,
         fat,
+        ingredients: Array.isArray(ingredients) ? ingredients : [],
+        macroSource: macroSource || 'user_entered',
       });
       if (!result.success) {
         throw new Error(result.error || 'Failed to log snack');
       }
       mealPlanHook.applyDayMeals(day, result.dayMeals);
+      setShowLogSnackModal(false);
       capture(posthog, 'snack_logged', {
         day,
         calories,
@@ -720,14 +813,14 @@ export default function MealsScreen() {
     }
   };
 
-  const handlePreviousWeek = useCallback(async () => {
-    const prevWeek = getPreviousWeek(mealPlanHook.currentWeekStarting);
-    if (prevWeek) await mealPlanHook.loadMealPlanByWeek(prevWeek);
+  const handlePreviousWeek = useCallback(async (weekStarting) => {
+    const target = weekStarting || getPreviousWeek(mealPlanHook.currentWeekStarting);
+    if (target) await mealPlanHook.loadMealPlanByWeek(target);
   }, [mealPlanHook.currentWeekStarting, mealPlanHook.loadMealPlanByWeek]);
 
-  const handleNextWeek = useCallback(async () => {
-    const nextWeek = getNextWeek(mealPlanHook.currentWeekStarting);
-    if (nextWeek) await mealPlanHook.loadMealPlanByWeek(nextWeek);
+  const handleNextWeek = useCallback(async (weekStarting) => {
+    const target = weekStarting || getNextWeek(mealPlanHook.currentWeekStarting);
+    if (target) await mealPlanHook.loadMealPlanByWeek(target);
   }, [mealPlanHook.currentWeekStarting, mealPlanHook.loadMealPlanByWeek]);
 
   // Keep latest week handlers in a ref so the header-slot effect doesn't
@@ -803,6 +896,14 @@ export default function MealsScreen() {
         userId: user?.id,
         meals: allMeals,
         userProfile,
+        weekStarting,
+        startDate: viewingCurrentWeek ? getTodayDate() : weekStarting,
+        skipPastDays: viewingCurrentWeek,
+        localDate: getTodayDate(),
+        completedSlots: (completions || []).map((c) => ({
+          day: c.day_of_week,
+          mealType: c.meal_type,
+        })),
       });
 
       if (result.success && result.groceryList) {
@@ -870,18 +971,6 @@ export default function MealsScreen() {
     }
   };
 
-  // Computed values
-  const hasMeals =
-    !!mealPlanHook.mealPlan &&
-    Object.values(mealPlanHook.mealPlan).some(
-      (day) =>
-        day &&
-        Object.entries(day).some(
-          ([mealType, meal]) =>
-            !mealType.includes('_rating') && meal && typeof meal === 'string' && meal.trim()
-        )
-    );
-
   const selectedDayMeals = mealPlanHook.mealPlan?.[selectedDay] || {};
   const dayToggles = getDayMealToggles(selectedDayMeals);
   const activeTypes = getActiveMealTypes(dayToggles, selectedDayMeals);
@@ -907,8 +996,8 @@ export default function MealsScreen() {
         onSelectDay={setSelectedDay}
         todayDayOfWeek={todayDayOfWeek}
         isCurrentWeek={isCurrentWeek}
-        onPreviousWeek={() => weekNavRef.current.onPreviousWeek()}
-        onNextWeek={() => weekNavRef.current.onNextWeek()}
+        onPreviousWeek={(week) => weekNavRef.current.onPreviousWeek(week)}
+        onNextWeek={(week) => weekNavRef.current.onNextWeek(week)}
         weekNavDisabled={!user || isGuest}
         animatedStyle={{
           paddingHorizontal: 16,
@@ -948,7 +1037,7 @@ export default function MealsScreen() {
     );
   }
 
-  if (mealPlanHook.isLoading && !hasMeals) {
+  if (mealPlanHook.isLoading) {
     return <MealsSkeleton />;
   }
 
@@ -968,22 +1057,16 @@ export default function MealsScreen() {
         </View>
       ) : null}
 
-      {/* Debug Prompt Display */}
-      {showDebugPrompt && debugPrompt && (
-        <View style={styles.debugPromptContainer}>
-          <View style={styles.debugPromptHeader}>
-            <Text style={styles.debugPromptTitle}>🐛 AI Prompt Sent</Text>
-            <TouchableOpacity onPress={() => setShowDebugPrompt(false)}>
-              <Ionicons name="close" size={24} color={colors.text} />
-            </TouchableOpacity>
-          </View>
-          <View style={styles.debugPromptContent}>
-            <ScrollView>
-              <Text style={styles.debugPromptText}>{debugPrompt}</Text>
-            </ScrollView>
-          </View>
-        </View>
-      )}
+      <AiPromptModal
+        visible={showAiPrompt}
+        prompt={aiPrompt}
+        loading={aiPromptLoading}
+        onClose={() => {
+          setShowAiPrompt(false);
+          setAiPrompt(null);
+          setAiPromptLoading(false);
+        }}
+      />
 
       {/* Body — always show meal cards (including empty slots) */}
       <ScrollView
@@ -998,23 +1081,10 @@ export default function MealsScreen() {
       >
         <View style={styles.toolbarRow}>
           <QuickActionsRow
-            hasMeals={hasMeals}
             onAnalytics={() => setShowAnalyticsModal(true)}
             onGroceryList={generateGroceryList}
-            onMealPrep={() => {
-              if (!canDo('meal_generation')) {
-                Alert.alert(
-                  'Daily Limit Reached',
-                  `You've used all ${DAILY_LIMITS.meal_generation} meal generations for today. Limits reset at midnight.`
-                );
-                return;
-              }
-              setShowMealPrepModal(true);
-            }}
-            onLogMeal={() => setShowLogMealModal(true)}
             loadingGroceryList={loadingGroceryList}
             groceryRemaining={remaining('grocery_list')}
-            canGenerate={canDo('meal_generation')}
           />
 
           <MealTypeToggles
@@ -1028,10 +1098,6 @@ export default function MealsScreen() {
           <View style={styles.clearActionsRow}>
             <TouchableOpacity onPress={handleClearSelectedDay} accessibilityRole="button">
               <Text style={styles.clearActionText}>Clear day</Text>
-            </TouchableOpacity>
-            <Text style={styles.clearActionDot}>·</Text>
-            <TouchableOpacity onPress={handleClearDisplayedWeek} accessibilityRole="button">
-              <Text style={styles.clearActionText}>Clear week</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -1134,7 +1200,15 @@ export default function MealsScreen() {
         onRate={(rating) => mealPlanHook.rateMeal(selectedDay, selectedMeal?.mealType, rating)}
         onEdit={handleEditMeal}
         onSaveMeal={!isGuest && user?.id ? handleSaveMeal : undefined}
-        onCopy={selectedMeal?.mealType === 'snacks' ? undefined : handleCopyMeal}
+        isMealSaved={Boolean(
+          selectedMeal &&
+            findSavedMeal(
+              favoriteMeals,
+              selectedMeal.mealType,
+              selectedMeal.name,
+              mealPlanHook.mealPlan?.[selectedDay]?.[selectedMeal.mealType]
+            )
+        )}
         onGetRecipe={handleGetRecipe}
         onRegenerate={handleRegenerate}
         onDelete={() => {
@@ -1155,15 +1229,6 @@ export default function MealsScreen() {
         savingMeal={savingMeal}
         canRegenerate={canDo('meal_generation')}
         canGetRecipe={canDo('recipe_generation')}
-      />
-
-      <CopyMealModal
-        visible={showCopyMealModal}
-        mealName={selectedMeal?.name}
-        mealType={selectedMeal?.mealType}
-        currentDay={selectedDay}
-        onCopy={handleConfirmCopyMeal}
-        onClose={() => setShowCopyMealModal(false)}
       />
 
       <EmptyMealOptionsBottomSheet
@@ -1204,8 +1269,12 @@ export default function MealsScreen() {
       <RecipeModal
         visible={showRecipeModal}
         recipe={recipe}
+        prompt={recipePrompt}
         mealName={selectedMeal?.name}
-        onClose={() => setShowRecipeModal(false)}
+        onClose={() => {
+          setShowRecipeModal(false);
+          setRecipePrompt(null);
+        }}
         onShare={handleShareRecipe}
         loading={loadingRecipe}
       />
@@ -1268,7 +1337,6 @@ export default function MealsScreen() {
         defaultMealType={logMealDefaultType}
         isGuest={isGuest}
         userId={user?.id}
-        mealPlan={mealPlanHook.mealPlan}
         weekStarting={mealPlanHook.currentWeekStarting}
       />
 
@@ -1286,6 +1354,7 @@ export default function MealsScreen() {
         onDelete={handleDeleteSnack}
         defaultDay={selectedDay}
         existingSnack={mealPlanHook.mealPlan?.[selectedDay]?.snacks || ''}
+        existingV2={mealPlanHook.mealPlan?.[selectedDay]?.snacks_v2 || null}
         snacksUserLogged={mealPlanHook.mealPlan?.[selectedDay]?.snacks_user_logged === true}
         submitting={logSnackSubmitting}
       />
@@ -1382,10 +1451,6 @@ const getStyles = (colors, isDarkMode) => StyleSheet.create({
     fontWeight: '700',
     color: colors.textSecondary,
   },
-  clearActionDot: {
-    fontSize: 13,
-    color: colors.textTertiary,
-  },
   timelineList: {
     marginTop: 2,
   },
@@ -1441,48 +1506,6 @@ const getStyles = (colors, isDarkMode) => StyleSheet.create({
   preferencesHintLink: {
     color: colors.primary,
     fontWeight: '700',
-  },
-  debugPromptContainer: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: colors.cardBackground,
-    borderBottomWidth: 2,
-    borderBottomColor: colors.primary,
-    maxHeight: 300,
-    zIndex: 100,
-    shadowColor: colors.shadowColor,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 10,
-  },
-  debugPromptHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: colors.primaryLight,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  debugPromptTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: colors.text,
-  },
-  debugPromptContent: {
-    maxHeight: 240,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  debugPromptText: {
-    fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    color: colors.text,
-    lineHeight: 18,
   },
 });
 

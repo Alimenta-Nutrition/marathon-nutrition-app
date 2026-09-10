@@ -59,7 +59,6 @@ export const MealPlanPage = ({
   onGenerateSingleMeal,
   onClearMeal,
   onClearDay,
-  onClearAllMeals,
   onCopyMeal,
   onRegenerate,
   onLoadWeek,
@@ -84,6 +83,7 @@ export const MealPlanPage = ({
   const { user } = useAuth();
   const [showRecipeModal, setShowRecipeModal] = useState(false);
   const [currentRecipe, setCurrentRecipe] = useState('');
+  const [recipePrompt, setRecipePrompt] = useState(null);
   const [recipeTitle, setRecipeTitle] = useState('');
   
   const [showGroceryModal, setShowGroceryModal] = useState(false);
@@ -208,17 +208,6 @@ export const MealPlanPage = ({
     }
   };
 
-  const handleClearWeek = async () => {
-    if (typeof onClearAllMeals !== 'function') return;
-    const ok = window.confirm('Clear all meals in the displayed week?');
-    if (!ok) return;
-    const result = await onClearAllMeals();
-    if (result && result.success === false) {
-      setLocalStatusMessage(`❌ ${result.error || 'Could not clear week'}`);
-      setTimeout(() => setLocalStatusMessage(''), 5000);
-    }
-  };
-
   const handleLogClick = (day = 'monday', mealType = 'lunch') => {
     setLogMealDefaults({ day, mealType });
     setShowLogModal(true);
@@ -238,7 +227,16 @@ export const MealPlanPage = ({
     setShowLogSnackModal(true);
   };
 
-  const handleLogSnack = async ({ day, name, calories, protein, carbs, fat }) => {
+  const handleLogSnack = async ({
+    day,
+    name,
+    calories,
+    protein,
+    carbs,
+    fat,
+    ingredients,
+    macroSource,
+  }) => {
     if (!user || isGuest) {
       setLocalStatusMessage('❌ Sign in to log snacks');
       setTimeout(() => setLocalStatusMessage(''), 3000);
@@ -258,6 +256,8 @@ export const MealPlanPage = ({
           protein,
           carbs,
           fat,
+          ingredients: Array.isArray(ingredients) ? ingredients : [],
+          macroSource: macroSource || 'user_entered',
         }),
       });
       const result = await res.json();
@@ -348,6 +348,7 @@ export const MealPlanPage = ({
       const proteinMatch = typeof mealString === 'string' ? mealString.match(/P:\s*(\d+)g/i) : null;
       const carbsMatch = typeof mealString === 'string' ? mealString.match(/C:\s*(\d+)g/i) : null;
       const fatMatch = typeof mealString === 'string' ? mealString.match(/F:\s*(\d+)g/i) : null;
+      const v2Macros = mealV2?.macros;
 
       const response = await authenticatedFetch(getApiUrl('/api/get-recipe'), {
         method: 'POST',
@@ -358,11 +359,13 @@ export const MealPlanPage = ({
           description,
           day,
           mealType,
+          mealId: mealV2?.id || undefined,
+          weekStarting: currentWeekStarting,
           macros: {
-            calories: calMatch ? parseInt(calMatch[1], 10) : 0,
-            protein: proteinMatch ? parseInt(proteinMatch[1], 10) : 0,
-            carbs: carbsMatch ? parseInt(carbsMatch[1], 10) : 0,
-            fat: fatMatch ? parseInt(fatMatch[1], 10) : 0,
+            calories: v2Macros?.calories ?? (calMatch ? parseInt(calMatch[1], 10) : 0),
+            protein: v2Macros?.protein ?? (proteinMatch ? parseInt(proteinMatch[1], 10) : 0),
+            carbs: v2Macros?.carbs ?? (carbsMatch ? parseInt(carbsMatch[1], 10) : 0),
+            fat: v2Macros?.fat ?? (fatMatch ? parseInt(fatMatch[1], 10) : 0),
           },
           servings: servings,
           dislikes: foodPreferences?.dislikes || '',
@@ -376,6 +379,7 @@ export const MealPlanPage = ({
       if (result.success) {
         setRecipeTitle(mealPlan[day][mealType]);
         setCurrentRecipe(result.recipe);
+        setRecipePrompt(result.prompt || null);
         setShowRecipeModal(true);
         setLocalStatusMessage('✅ Recipe generated!');
         capture('recipe_viewed', { meal_type: mealType });
@@ -428,6 +432,7 @@ export const MealPlanPage = ({
           userId: user?.id,
           meals: allMeals,
           userProfile,
+          weekStarting: currentWeekStarting,
         }),
       });
 
@@ -951,13 +956,6 @@ export const MealPlanPage = ({
             onClick: () => setShowMealPrepModal(true),
             show: true,
           },
-          {
-            id: 'clear-week',
-            label: 'Clear week',
-            icon: Trash2,
-            onClick: handleClearWeek,
-            show: Boolean(onClearAllMeals && hasMeals),
-          },
         ]
           .filter((a) => a.show)
           .map(({ id, label, icon: Icon, onClick }) => (
@@ -1447,8 +1445,12 @@ export const MealPlanPage = ({
 
       <RecipeModal
         isOpen={showRecipeModal}
-        onClose={() => setShowRecipeModal(false)}
+        onClose={() => {
+          setShowRecipeModal(false);
+          setRecipePrompt(null);
+        }}
         recipe={currentRecipe}
+        prompt={recipePrompt}
         title={recipeTitle}
       />
 
@@ -1509,6 +1511,7 @@ export const MealPlanPage = ({
         onDelete={handleDeleteSnack}
         defaultDay={logSnackDay}
         existingSnack={mealPlan?.[logSnackDay]?.snacks || ''}
+        existingV2={mealPlan?.[logSnackDay]?.snacks_v2 || null}
         snacksUserLogged={mealPlan?.[logSnackDay]?.snacks_user_logged === true}
         submitting={logSnackSubmitting}
       />
@@ -1747,7 +1750,7 @@ const MealCard = ({
 
   const handleSave = async () => {
     if (!meal || isGuest) return;
-    await onSaveMeal(mealType, meal);
+    await onSaveMeal(mealType, meal, mealV2);
   };
 
   const handleToggleComplete = async (e) => {

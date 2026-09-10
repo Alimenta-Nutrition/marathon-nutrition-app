@@ -82,6 +82,11 @@ describe('weekdayFromWeekStartingAndDate', () => {
     expect(weekdayFromWeekStartingAndDate(WEEK_STARTING, '2026-08-30')).toBeNull();
     expect(weekdayFromWeekStartingAndDate(WEEK_STARTING, '2026-09-07')).toBeNull();
   });
+
+  it('maps Sunday across a month and year boundary without timezone shift', () => {
+    expect(weekdayFromWeekStartingAndDate('2026-02-23', '2026-03-01')).toBe('sunday');
+    expect(weekdayFromWeekStartingAndDate('2025-12-29', '2026-01-04')).toBe('sunday');
+  });
 });
 
 describe('normalizedMealToDisplayString', () => {
@@ -127,6 +132,7 @@ describe('mergeNormalizedMealsIntoLegacyWeek', () => {
     });
 
     expect(week.monday.lunch_v2).toEqual({
+      id: 'norm-lunch',
       meal_name: 'Chicken Rice Bowl',
       macros: {
         calories: 844.2,

@@ -8,6 +8,9 @@ import {
   scaleIngredientByGrams,
   sumLoggedIngredientMacros,
 } from '../../../shared/lib/loggedMealMacros';
+import { savedMealLogPayload } from '../../../shared/lib/savedMealStructure';
+import { shouldCollapseLoggedFoodInput } from '../../../shared/lib/loggedFoodReview';
+import { LoggedFoodReview } from './LoggedFoodReview';
 import {
   Dialog,
   DialogContent,
@@ -92,6 +95,14 @@ export const LogMealModal = ({
   const [hasManualMacroOverride, setHasManualMacroOverride] = useState(false);
   const [totalMacros, setTotalMacros] = useState(null);
   const [gramDrafts, setGramDrafts] = useState({});
+  const [macroMode, setMacroMode] = useState('auto');
+  const [manualCalories, setManualCalories] = useState('');
+  const [manualProtein, setManualProtein] = useState('');
+  const [manualCarbs, setManualCarbs] = useState('');
+  const [manualFat, setManualFat] = useState('');
+  const [editingDescription, setEditingDescription] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [editingTotals, setEditingTotals] = useState(false);
 
   useEffect(() => {
     if (defaultDay) setSelectedDay(defaultDay);
@@ -100,11 +111,30 @@ export const LogMealModal = ({
 
   const filteredSavedMeals = savedMeals.filter((m) => m.meal_type === selectedMealType);
 
+  const resetReviewChrome = () => {
+    setEditingDescription(false);
+    setEditingName(false);
+    setEditingTotals(false);
+  };
+
   const clearEstimate = () => {
     setEstimate(null);
     setTotalMacros(null);
     setHasManualMacroOverride(false);
     setGramDrafts({});
+    resetReviewChrome();
+  };
+
+  const setMode = (mode) => {
+    setMacroMode(mode);
+    clearEstimate();
+    setError('');
+    if (mode === 'auto') {
+      setManualCalories('');
+      setManualProtein('');
+      setManualCarbs('');
+      setManualFat('');
+    }
   };
 
   const persistLoggedMeal = async ({ mealName, macros, macroSource, ingredients = [] }) => {
@@ -168,19 +198,24 @@ export const LogMealModal = ({
     setTotalMacros(next.macros);
     setHasManualMacroOverride(false);
     setGramDrafts({});
+    setEditingDescription(false);
+    setEditingName(false);
+    setEditingTotals(false);
     return next;
   };
 
-  const handleEstimateMacros = async () => {
-    if (!mealDescription.trim()) return;
+  const handleEstimate = async () => {
+    if (!mealDescription.trim() || logged || isLogging || isEstimating) return;
     setIsEstimating(true);
     setError('');
     try {
       await runEstimate();
     } catch (err) {
-      console.error('Failed to estimate macros:', err);
+      if (isGuest) {
+        finishLog(mealDescription.trim());
+        return;
+      }
       setError(err.message || 'Could not estimate macros. Try again.');
-      clearEstimate();
     } finally {
       setIsEstimating(false);
     }
@@ -217,24 +252,49 @@ export const LogMealModal = ({
     if (!mealDescription.trim() || logged || isLogging || isEstimating) return;
 
     const fallbackName = mealDescription.trim();
+    const showReview = shouldCollapseLoggedFoodInput({
+      estimate,
+      totalMacros,
+      macroMode,
+    });
+
+    if (macroMode === 'auto' && !showReview) {
+      await handleEstimate();
+      return;
+    }
+
     setIsLogging(true);
     setError('');
 
     try {
-      let current = estimate;
-      if (!current || !macrosAreValid(totalMacros || current.macros)) {
-        try {
-          current = await runEstimate();
-        } catch (err) {
-          if (isGuest) {
-            finishLog(fallbackName);
-            return;
-          }
-          throw err;
+      if (macroMode === 'manual') {
+        const macros = {
+          calories: Number(manualCalories),
+          protein: Number(manualProtein),
+          carbs: Number(manualCarbs),
+          fat: Number(manualFat),
+        };
+        if (!macrosAreValid(macros) || macros.calories < 1) {
+          throw new Error('Enter valid calories, protein, carbs, and fat.');
         }
+        const mealString = formatMealString(fallbackName, macros);
+        await persistLoggedMeal({
+          mealName: fallbackName,
+          macros,
+          macroSource: 'user_entered',
+          ingredients: [],
+        });
+        finishLog(mealString, {
+          meal_name: fallbackName,
+          macros,
+          macro_source: 'user_entered',
+          provider: 'user_logged',
+          ingredients: [],
+        });
         return;
       }
 
+      const current = estimate;
       const mealName = (current.mealName || fallbackName).trim();
       const macros = {
         calories: Number(totalMacros.calories),
@@ -277,17 +337,20 @@ export const LogMealModal = ({
     setError('');
 
     try {
-      const parsed = macrosFromSavedMeal(savedMeal);
-      if (!parsed || !parsed.name) {
+      const payload = savedMealLogPayload(savedMeal);
+      if (!payload.mealName) {
         throw new Error('This saved meal is missing macros and cannot be logged.');
       }
-      const macros = roundLoggedMacros(parsed);
-      const mealString = formatMealString(parsed.name, macros);
+      const macros = roundLoggedMacros(payload.macros);
+      if (!macrosAreValid(macros)) {
+        throw new Error('This saved meal is missing macros and cannot be logged.');
+      }
+      const mealString = formatMealString(payload.mealName, macros);
       await persistLoggedMeal({
-        mealName: parsed.name,
+        mealName: payload.mealName,
         macros,
-        macroSource: 'user_entered',
-        ingredients: [],
+        macroSource: payload.macroSource,
+        ingredients: payload.ingredients,
       });
       if (onUseSavedMeal) {
         try {
@@ -297,11 +360,11 @@ export const LogMealModal = ({
         }
       }
       finishLog(mealString, {
-        meal_name: parsed.name,
+        meal_name: payload.mealName,
         macros,
-        macro_source: 'user_entered',
+        macro_source: payload.macroSource,
         provider: 'user_logged',
-        ingredients: [],
+        ingredients: payload.ingredients,
       });
     } catch (err) {
       console.error('Failed to log saved meal:', err);
@@ -318,10 +381,39 @@ export const LogMealModal = ({
     setActiveTab('enter');
     setError('');
     setIsLogging(false);
+    setMacroMode('auto');
+    setManualCalories('');
+    setManualProtein('');
+    setManualCarbs('');
+    setManualFat('');
     onClose();
   };
 
-  const showReview = Boolean(estimate && totalMacros);
+  const showReview = shouldCollapseLoggedFoodInput({
+    estimate,
+    totalMacros,
+    macroMode,
+  });
+  const manualReady =
+    manualCalories.trim() !== '' &&
+    manualProtein.trim() !== '' &&
+    manualCarbs.trim() !== '' &&
+    manualFat.trim() !== '';
+  const canLog =
+    mealDescription.trim() &&
+    !logged &&
+    !isEstimating &&
+    !isLogging &&
+    (macroMode === 'auto' || manualReady);
+  const ctaLabel = logged
+    ? 'Logged!'
+    : isEstimating
+      ? 'Calculating ingredients...'
+      : isLogging
+        ? 'Logging...'
+        : macroMode === 'auto' && !showReview
+          ? 'Calculate for me'
+          : 'Log Meal';
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && handleClose()}>
@@ -333,7 +425,7 @@ export const LogMealModal = ({
           </DialogTitle>
         </DialogHeader>
 
-        {!isGuest && savedMeals.length > 0 && (
+        {!isGuest && savedMeals.length > 0 && !showReview && (
           <div className="flex border-b">
             <button
               onClick={() => setActiveTab('enter')}
@@ -360,227 +452,180 @@ export const LogMealModal = ({
         )}
 
         <div className="p-4 space-y-4 overflow-y-auto flex-1">
-          {error && (
+          {error && !showReview && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
               {error}
             </div>
           )}
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Which day?</label>
-            <div className="grid grid-cols-4 gap-2">
-              {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map(
-                (day) => (
-                  <button
-                    key={day}
-                    onClick={() => setSelectedDay(day)}
-                    className={`p-2 rounded-lg text-xs font-medium transition-colors capitalize ${
-                      selectedDay === day
-                        ? 'bg-primary text-white'
-                        : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
-                    }`}
-                  >
-                    {day.slice(0, 3)}
-                  </button>
-                )
-              )}
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Which meal?</label>
-            <div className="grid grid-cols-5 gap-2">
-              {MEAL_TYPES.map((type) => (
-                <button
-                  key={type}
-                  onClick={() => {
-                    setSelectedMealType(type);
-                    clearEstimate();
-                  }}
-                  className={`p-2 rounded-lg text-xs font-medium transition-colors capitalize ${
-                    selectedMealType === type
-                      ? 'bg-primary text-white'
-                      : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
-                  }`}
-                >
-                  {type}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {activeTab === 'enter' && (
+          {!showReview && (
             <>
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  What did you eat?
-                </label>
-                <p className="text-xs text-gray-500 mb-2">
-                  Include amounts when you know them for improved accuracy (2 eggs, 120g chicken, 1 tbsp oil)
-                </p>
-                <textarea
-                  value={mealDescription}
-                  onChange={(e) => {
-                    setMealDescription(e.target.value);
-                    clearEstimate();
-                  }}
-                  placeholder="e.g., eggs with a bagel, bacon, and avocado"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary resize-none"
-                  rows={3}
-                />
+                <label className="block text-sm font-medium text-gray-700 mb-2">Which day?</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map(
+                    (day) => (
+                      <button
+                        key={day}
+                        onClick={() => setSelectedDay(day)}
+                        className={`p-2 rounded-lg text-xs font-medium transition-colors capitalize ${
+                          selectedDay === day
+                            ? 'bg-primary text-white'
+                            : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                        }`}
+                      >
+                        {day.slice(0, 3)}
+                      </button>
+                    )
+                  )}
+                </div>
               </div>
 
-              {mealDescription.trim() && !showReview && (
-                <button
-                  onClick={handleEstimateMacros}
-                  disabled={isEstimating}
-                  className="w-full py-2 px-4 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50"
-                >
-                  {isEstimating ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Estimating ingredients...
-                    </>
-                  ) : (
-                    'Estimate ingredients'
-                  )}
-                </button>
-              )}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Which meal?</label>
+                <div className="grid grid-cols-5 gap-2">
+                  {MEAL_TYPES.map((type) => (
+                    <button
+                      key={type}
+                      onClick={() => {
+                        setSelectedMealType(type);
+                        clearEstimate();
+                      }}
+                      className={`p-2 rounded-lg text-xs font-medium transition-colors capitalize ${
+                        selectedMealType === type
+                          ? 'bg-primary text-white'
+                          : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                      }`}
+                    >
+                      {type}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
 
-              {showReview && (
-                <div className="space-y-3 p-3 bg-green-50 border border-green-200 rounded-lg">
+          {(activeTab === 'enter' || showReview) && (
+            <>
+              {showReview ? (
+                <LoggedFoodReview
+                  originalDescription={mealDescription}
+                  onOriginalDescriptionChange={setMealDescription}
+                  descriptionPlaceholder="e.g., eggs with a bagel, bacon, and avocado"
+                  editingDescription={editingDescription}
+                  onToggleEditDescription={setEditingDescription}
+                  estimate={estimate}
+                  totalMacros={totalMacros}
+                  onMealNameChange={(text) => setEstimate({ ...estimate, mealName: text })}
+                  editingName={editingName}
+                  onToggleEditName={setEditingName}
+                  editingTotals={editingTotals}
+                  onToggleEditTotals={setEditingTotals}
+                  onTotalChange={handleTotalChange}
+                  gramDrafts={gramDrafts}
+                  onGramDraftChange={(index, text) =>
+                    setGramDrafts((prev) => ({ ...prev, [index]: text }))
+                  }
+                  onGramCommit={handleGramCommit}
+                  isEstimating={isEstimating}
+                  estimateError={error}
+                  onRetryEstimate={handleEstimate}
+                  onSwitchToManual={() => {
+                    setError('');
+                    setEditingTotals(true);
+                  }}
+                  hasManualMacroOverride={hasManualMacroOverride}
+                />
+              ) : (
+                <>
                   <div>
-                    <label className="block text-xs font-medium text-green-800 mb-1">Meal name</label>
-                    <input
-                      value={estimate.mealName}
-                      onChange={(e) =>
-                        setEstimate({ ...estimate, mealName: e.target.value })
-                      }
-                      className="w-full px-2 py-1.5 text-sm border border-green-200 rounded bg-white"
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      What did you eat?
+                    </label>
+                    <p className="text-xs text-gray-500 mb-2">
+                      Include amounts when you know them for improved accuracy (2 eggs, 120g chicken, 1 tbsp oil)
+                    </p>
+                    <textarea
+                      value={mealDescription}
+                      onChange={(e) => setMealDescription(e.target.value)}
+                      placeholder="e.g., eggs with a bagel, bacon, and avocado"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary resize-none"
+                      rows={3}
+                      disabled={isEstimating || isLogging}
                     />
+                    {isEstimating ? (
+                      <p className="text-sm font-medium text-gray-600 mt-2">Calculating ingredients...</p>
+                    ) : null}
                   </div>
 
-                  {estimate.ingredients.length > 0 && (
-                    <div>
-                      <p className="text-xs font-medium text-green-800 mb-2">
-                        Ingredients (edit grams to recalculate)
-                      </p>
-                      <div className="space-y-1.5">
-                        {estimate.ingredients.map((ing, index) => (
-                          <div
-                            key={`${ing.name}-${index}`}
-                            className="flex items-center gap-2 text-sm bg-white/80 rounded px-2 py-1.5"
-                          >
-                            <div className="flex-1 min-w-0">
-                              <p className="truncate font-medium text-gray-900">{ing.name}</p>
-                              <p className="text-[11px] text-gray-500">
-                                {ing.calories} cal · {ing.protein}P {ing.carbs}C {ing.fat}F
-                              </p>
-                            </div>
-                            <div className="flex items-center gap-1 shrink-0">
-                              <input
-                                type="number"
-                                min="0"
-                                step="1"
-                                value={
-                                  gramDrafts[index] != null ? gramDrafts[index] : ing.grams
-                                }
-                                onChange={(e) =>
-                                  setGramDrafts((prev) => ({
-                                    ...prev,
-                                    [index]: e.target.value,
-                                  }))
-                                }
-                                onBlur={(e) => handleGramCommit(index, e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') {
-                                    e.target.blur();
-                                  }
-                                }}
-                                className="w-16 px-1.5 py-1 text-right text-sm border border-gray-200 rounded"
-                              />
-                              <span className="text-xs text-gray-500">g</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
                   <div>
-                    <p className="text-xs font-medium text-green-800 mb-2">
-                      Totals {hasManualMacroOverride ? '(manual override)' : ''}
-                    </p>
+                    <p className="text-sm font-medium text-gray-700 mb-2">Macros</p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setMode('auto')}
+                        className={`p-2 rounded-lg text-sm font-semibold border ${
+                          macroMode === 'auto'
+                            ? 'border-primary text-primary bg-primary/5'
+                            : 'border-gray-200 text-gray-600'
+                        }`}
+                      >
+                        Calculate for me
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMode('manual')}
+                        className={`p-2 rounded-lg text-sm font-semibold border ${
+                          macroMode === 'manual'
+                            ? 'border-primary text-primary bg-primary/5'
+                            : 'border-gray-200 text-gray-600'
+                        }`}
+                      >
+                        Enter myself
+                      </button>
+                    </div>
+                  </div>
+
+                  {macroMode === 'manual' ? (
                     <div className="grid grid-cols-4 gap-2">
                       {[
-                        { key: 'calories', label: 'Cal' },
-                        { key: 'protein', label: 'P' },
-                        { key: 'carbs', label: 'C' },
-                        { key: 'fat', label: 'F' },
+                        { key: 'calories', label: 'Cal', value: manualCalories, set: setManualCalories },
+                        { key: 'protein', label: 'P (g)', value: manualProtein, set: setManualProtein },
+                        { key: 'carbs', label: 'C (g)', value: manualCarbs, set: setManualCarbs },
+                        { key: 'fat', label: 'F (g)', value: manualFat, set: setManualFat },
                       ].map((field) => (
                         <label key={field.key} className="block">
-                          <span className="block text-[11px] text-gray-500 mb-0.5">
+                          <span className="block text-[11px] font-medium text-gray-500 mb-0.5">
                             {field.label}
                           </span>
                           <input
                             type="number"
                             min="0"
                             step="0.1"
-                            value={totalMacros[field.key]}
-                            onChange={(e) => handleTotalChange(field.key, e.target.value)}
-                            className="w-full px-1.5 py-1 text-sm border border-gray-200 rounded bg-white text-center"
+                            value={field.value}
+                            onChange={(e) => field.set(e.target.value)}
+                            className="w-full px-1.5 py-1 text-sm border rounded bg-white text-center"
                           />
                         </label>
                       ))}
                     </div>
-                    <p className="text-[11px] text-gray-500 mt-2">
-                      {estimate.macroSource === 'ml_estimate'
-                        ? 'Fallback total estimate — no ingredient breakdown.'
-                        : hasManualMacroOverride
-                          ? 'Totals are a manual override. Changing grams restores USDA totals.'
-                          : 'Totals are the sum of the ingredients above.'}
-                    </p>
-                  </div>
-                </div>
-              )}
+                  ) : null}
 
-              <button
-                onClick={handleLog}
-                disabled={!mealDescription.trim() || logged || isEstimating || isLogging}
-                className={`w-full py-2 px-4 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 ${
-                  logged
-                    ? 'bg-green-500 text-white'
-                    : !mealDescription.trim() || isEstimating || isLogging
-                    ? 'bg-gray-200 text-gray-500 cursor-not-allowed'
-                    : 'bg-primary text-white hover:bg-primary/90'
-                }`}
-              >
-                {logged ? (
-                  <>
-                    <Check className="w-4 h-4" />
-                    Logged!
-                  </>
-                ) : isLogging || isEstimating ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    {isEstimating && !showReview ? 'Estimating ingredients...' : 'Logging...'}
-                  </>
-                ) : showReview ? (
-                  <>
-                    <UtensilsCrossed className="w-4 h-4" />
-                    Log Meal
-                  </>
-                ) : (
-                  <>
-                    <UtensilsCrossed className="w-4 h-4" />
-                    Estimate & review
-                  </>
-                )}
-              </button>
+                  {error && macroMode === 'auto' ? (
+                    <button
+                      type="button"
+                      onClick={() => setMode('manual')}
+                      className="text-sm font-semibold text-primary"
+                    >
+                      Enter myself
+                    </button>
+                  ) : null}
+                </>
+              )}
             </>
           )}
 
-          {activeTab === 'saved' && (
+          {activeTab === 'saved' && !showReview && (
             <div className="space-y-2">
               {filteredSavedMeals.length === 0 ? (
                 <div className="text-center py-8 text-gray-500">
@@ -668,6 +713,39 @@ export const LogMealModal = ({
             </div>
           )}
         </div>
+
+        {(activeTab === 'enter' || showReview) && (
+          <div className="p-4 border-t">
+            <button
+              onClick={handleLog}
+              disabled={!canLog}
+              className={`w-full py-2 px-4 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 ${
+                logged
+                  ? 'bg-green-500 text-white'
+                  : !canLog
+                  ? 'bg-gray-200 text-gray-500 cursor-not-allowed'
+                  : 'bg-primary text-white hover:bg-primary/90'
+              }`}
+            >
+              {logged ? (
+                <>
+                  <Check className="w-4 h-4" />
+                  Logged!
+                </>
+              ) : isLogging || isEstimating ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {ctaLabel}
+                </>
+              ) : (
+                <>
+                  <UtensilsCrossed className="w-4 h-4" />
+                  {ctaLabel}
+                </>
+              )}
+            </button>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   );

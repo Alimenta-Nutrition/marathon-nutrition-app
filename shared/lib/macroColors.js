@@ -10,4 +10,11 @@ export const macroColors = {
   fat: '#A4B8C4',
 };
 
+export const MACRO_COLOR_FIELDS = [
+  { key: 'calories', label: 'Cal', suffix: ' cal' },
+  { key: 'protein', label: 'P', suffix: 'P' },
+  { key: 'carbs', label: 'C', suffix: 'C' },
+  { key: 'fat', label: 'F', suffix: 'F' },
+];
+
 export default macroColors;

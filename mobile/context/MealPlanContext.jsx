@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { Alert } from 'react-native';
 import { saveMealPlan } from '../../shared/lib/dataClient';
 import { apiClient, authenticatedFetch, getApiUrl } from '../../shared/services/api';
 import { resolveMealToggles } from '../../shared/lib/mealSlots';
@@ -48,6 +49,14 @@ const EMPTY_WEEK = {
   saturday:  { ...EMPTY_DAY },
   sunday:    { ...EMPTY_DAY },
 };
+
+function cloneWeekPlan(week = EMPTY_WEEK) {
+  const next = {};
+  DAYS.forEach((day) => {
+    next[day] = { ...(week?.[day] || EMPTY_DAY) };
+  });
+  return next;
+}
 
 const getMondayOfCurrentWeek = () => {
   const today = new Date();
@@ -172,6 +181,7 @@ export function MealPlanProvider({ children }) {
   /** Skip the first auto-save after a successful fetch/hydration. */
   const skipNextAutoSaveRef = useRef(false);
   const loadGenerationRef = useRef(0);
+  const pendingWeekRef = useRef(null);
 
   const hasDataRef = useRef(false);
   const lastFetchedAtRef = useRef(null);
@@ -204,6 +214,7 @@ export function MealPlanProvider({ children }) {
     inflightRef.current = null;
     skipNextAutoSaveRef.current = false;
     loadGenerationRef.current += 1;
+    pendingWeekRef.current = null;
   }
 
   const loadCurrentWeek = useCallback(async ({ background = false } = {}) => {
@@ -222,6 +233,10 @@ export function MealPlanProvider({ children }) {
       return;
     }
 
+    if (pendingWeekRef.current) {
+      return undefined;
+    }
+
     if (inflightRef.current) {
       console.log('MealPlanProvider: dedup — joining in-flight request');
       return inflightRef.current;
@@ -237,7 +252,7 @@ export function MealPlanProvider({ children }) {
     const generation = ++loadGenerationRef.current;
     const promise = (async () => {
       try {
-        const week = getMondayOfCurrentWeek();
+        const week = currentWeekStartingRef.current || getMondayOfCurrentWeek();
         console.log('MealPlanProvider: fetching current week via /api/meal-plan + /api/meals', {
           userId: uid,
           weekStarting: week,
@@ -251,12 +266,14 @@ export function MealPlanProvider({ children }) {
         });
         if (userRef.current?.id !== uid) return;
         if (loadGenerationRef.current !== generation) return;
+        if (pendingWeekRef.current) return;
 
         const merged = mergeWeekMeals(result.week);
         skipNextAutoSaveRef.current = true;
         setMealPlan(merged);
         mealPlanRef.current = merged;
-        setCurrentWeekStarting(result.weekStarting || week);
+        setCurrentWeekStarting(week);
+        currentWeekStartingRef.current = week;
         setFetchError(null);
         setHasData(true);
         hasDataRef.current = true;
@@ -340,39 +357,50 @@ export function MealPlanProvider({ children }) {
 
   const rateMeal = async (day, mealType, rating) => {
     if (!day || !(day in mealPlanRef.current)) return;
-    const mealDescription = mealPlanRef.current[day]?.[mealType];
+    const ratingKey = `${mealType}_rating`;
+    const previousRating = mealPlanRef.current[day]?.[ratingKey];
+    if (previousRating === rating) return;
 
-    if (user && !isGuest) {
-      try {
-        if (mealDescription && String(mealDescription).trim()) {
-          const res = await authenticatedFetch(getApiUrl('/api/rate-meal'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: user.id,
-              mealDescription,
-              mealType,
-              rating,
-              day,
-              weekStarting: currentWeekStartingRef.current,
-            }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok || !data.success) {
-            throw new Error(data.error || `HTTP ${res.status}`);
-          }
-        }
-      } catch (err) {
-        console.error('MealPlanProvider: error saving rating', err);
-        return;
-      }
-    }
+    const mealDescription = mealPlanRef.current[day]?.[mealType];
 
     setMealPlan((prev) => ({
       ...prev,
-      [day]: { ...prev[day], [`${mealType}_rating`]: rating },
+      [day]: { ...prev[day], [ratingKey]: rating },
     }));
     capture(posthog, 'meal_rated', { rating, meal_type: mealType });
+
+    const u = userRef.current;
+    if (!u || isGuestRef.current) return;
+    if (!mealDescription || !String(mealDescription).trim()) return;
+
+    try {
+      const res = await authenticatedFetch(getApiUrl('/api/rate-meal'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: u.id,
+          mealDescription,
+          mealType,
+          rating,
+          day,
+          weekStarting: currentWeekStartingRef.current,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      console.error('MealPlanProvider: error saving rating', err);
+      setMealPlan((prev) => {
+        if (prev[day]?.[ratingKey] !== rating) return prev;
+        return {
+          ...prev,
+          [day]: { ...prev[day], [ratingKey]: previousRating },
+        };
+      });
+      Alert.alert('Could not save rating', err.message || 'Failed to save rating');
+    }
   };
 
   const generateDay = async (day, userProfile, foodPreferences, workoutsContext, onDebug) => {
@@ -874,91 +902,35 @@ export function MealPlanProvider({ children }) {
     return { success: true };
   };
 
-  const copyMeal = async (sourceDay, sourceMealType, destinationDays) => {
-    if (!sourceDay || !(sourceDay in mealPlanRef.current)) {
-      return { success: false, error: 'Invalid source day' };
-    }
-    if (!MEAL_TYPES.includes(sourceMealType) || sourceMealType === 'snacks') {
-      return { success: false, error: 'Invalid meal type' };
-    }
-
-    const dests = (Array.isArray(destinationDays) ? destinationDays : []).filter(
-      (d) => d && d !== sourceDay && DAYS.includes(d)
-    );
-    if (dests.length === 0) {
-      return { success: false, error: 'Select at least one destination day' };
-    }
-
-    const sourceMeal = mealPlanRef.current[sourceDay]?.[sourceMealType];
-    const sourceV2 = mealPlanRef.current[sourceDay]?.[v2Key(sourceMealType)];
-    if (
-      !sourceMeal ||
-      typeof sourceMeal !== 'string' ||
-      !sourceMeal.trim() ||
-      sourceMeal === '__generating__'
-    ) {
-      return { success: false, error: 'No meal to copy' };
-    }
-
-    const u = userRef.current;
-    if (u && !isGuestRef.current) {
-      const week = currentWeekStartingRef.current;
-      if (!week) {
-        return { success: false, error: 'Missing week starting date. Please close and try again.' };
-      }
-      try {
-        const result = await apiClient.copyMeal({
-          sourceDay,
-          sourceMealType,
-          sourceWeekStarting: week,
-          destinationDays: dests,
-          destinationWeekStarting: week,
-        });
-        if (!result?.success) {
-          throw new Error(result?.error || 'Failed to copy meal');
-        }
-      } catch (error) {
-        const message = error.message || 'Failed to copy meal';
-        setStatusMessage(`❌ ${message}`);
-        setTimeout(() => setStatusMessage(''), 5000);
-        return { success: false, error: message };
-      }
-    }
-
-    setMealPlan((prev) => {
-      const next = { ...prev };
-      dests.forEach((day) => {
-        next[day] = applyStructuredMealToDay(next[day], sourceMealType, {
-          legacyString: sourceMeal,
-          structuredMeal: sourceV2,
-        });
-      });
-      return next;
-    });
-
-    return { success: true };
-  };
-
   // Get current meal count status (for UI to determine button state)
   const getMealStatus = () => countMeals(mealPlan);
 
   // -------- WEEK NAVIGATION / SAVE --------
-  const loadMealPlanByWeek = async (weekStarting) => {
+  const loadMealPlanByWeek = useCallback(async (weekStarting) => {
     const u = userRef.current;
     if (!u || isGuestRef.current) {
       return { success: false, error: 'Guests cannot browse other weeks' };
     }
-    const generation = ++loadGenerationRef.current;
-    try {
-      setIsLoading(true);
+    if (!weekStarting) {
+      return { success: false, error: 'Missing week starting date' };
+    }
 
+    const requestedWeek = weekStarting;
+    pendingWeekRef.current = requestedWeek;
+    const generation = ++loadGenerationRef.current;
+
+    skipNextAutoSaveRef.current = true;
+    setIsLoading(true);
+    setFetchError(null);
+
+    try {
       console.log('MealPlanProvider: loadMealPlanByWeek via /api/meal-plan + /api/meals', {
         userId: u.id,
-        weekStarting,
+        weekStarting: requestedWeek,
       });
 
       const result = await loadMergedWebMealWeek({
-        weekStarting,
+        weekStarting: requestedWeek,
         fetchLegacyWeek: (week) => fetchLegacyMealPlanWeek(u.id, week),
         fetchNormalizedMeals: fetchNormalizedMealsForRange,
         fetchDaySettings: fetchDaySettingsForRange,
@@ -966,33 +938,45 @@ export function MealPlanProvider({ children }) {
       if (loadGenerationRef.current !== generation) {
         return { success: true, stale: true };
       }
+      if (pendingWeekRef.current !== requestedWeek) {
+        return { success: true, stale: true };
+      }
 
       const merged = mergeWeekMeals(result.week);
       skipNextAutoSaveRef.current = true;
-      setMealPlan(merged);
       mealPlanRef.current = merged;
-      setCurrentWeekStarting(result.weekStarting || weekStarting);
+      currentWeekStartingRef.current = requestedWeek;
+      setMealPlan(merged);
+      setCurrentWeekStarting(requestedWeek);
       setHasData(true);
       hasDataRef.current = true;
+      const now = Date.now();
+      setLastFetchedAt(now);
+      lastFetchedAtRef.current = now;
       setFetchError(null);
+      pendingWeekRef.current = null;
       return { success: true };
     } catch (error) {
       console.error('MealPlanProvider: error loading week', error);
-      if (loadGenerationRef.current === generation) {
+      if (loadGenerationRef.current === generation && pendingWeekRef.current === requestedWeek) {
         skipNextAutoSaveRef.current = true;
-        setMealPlan(EMPTY_WEEK);
-        mealPlanRef.current = EMPTY_WEEK;
-        setCurrentWeekStarting(weekStarting);
+        const empty = cloneWeekPlan();
+        mealPlanRef.current = empty;
+        currentWeekStartingRef.current = requestedWeek;
+        setMealPlan(empty);
+        setCurrentWeekStarting(requestedWeek);
         setHasData(true);
         hasDataRef.current = true;
+        pendingWeekRef.current = null;
       }
       return { success: false, error: error.message };
     } finally {
       if (loadGenerationRef.current === generation) {
         setIsLoading(false);
+        setIsValidating(false);
       }
     }
-  };
+  }, []);
 
   const saveCurrentMealPlan = async () => {
     const u = userRef.current;
@@ -1031,7 +1015,10 @@ export function MealPlanProvider({ children }) {
       return { success: false };
     }
 
-    const updated = (prev) => ({
+    const previousDessert = mealPlanRef.current?.[day]?.include_dessert;
+    if (previousDessert === includeDessert) return { success: true };
+
+    const applyToggle = (prev) => ({
       ...prev,
       [day]: {
         ...prev[day],
@@ -1040,33 +1027,46 @@ export function MealPlanProvider({ children }) {
       },
     });
 
-    const u = userRef.current;
-    if (u && !isGuestRef.current) {
-      try {
-        const result = await apiClient.patchDaySettings({
-          weekStarting: week,
-          day,
-          include_dessert: includeDessert,
-        });
-        if (!result?.success) {
-          throw new Error(result?.error || 'Failed to save dessert setting');
-        }
-      } catch (err) {
-        console.error('MealPlanProvider: error saving dessert toggle', err);
-        return { success: false, error: err.message };
-      }
-    }
-
-    const newPlan = updated(mealPlanRef.current);
+    const newPlan = applyToggle(mealPlanRef.current);
     setMealPlan(newPlan);
     mealPlanRef.current = newPlan;
 
-    if (u && !isGuestRef.current) {
-      try {
-        await saveMealPlan(u.id, newPlan, week);
-      } catch (err) {
-        console.error('MealPlanProvider: error saving toggle state', err);
+    const u = userRef.current;
+    if (!u || isGuestRef.current) return { success: true };
+
+    try {
+      const result = await apiClient.patchDaySettings({
+        weekStarting: week,
+        day,
+        include_dessert: includeDessert,
+      });
+      if (!result?.success) {
+        throw new Error(result?.error || 'Failed to save dessert setting');
       }
+    } catch (err) {
+      console.error('MealPlanProvider: error saving dessert toggle', err);
+      if (currentWeekStartingRef.current === week) {
+        setMealPlan((prev) => {
+          if (prev[day]?.include_dessert !== includeDessert) return prev;
+          const rolled = {
+            ...prev,
+            [day]: {
+              ...prev[day],
+              include_dessert: previousDessert,
+            },
+          };
+          mealPlanRef.current = rolled;
+          return rolled;
+        });
+      }
+      Alert.alert('Could not save dessert setting', err.message || 'Failed to save dessert setting');
+      return { success: false, error: err.message };
+    }
+
+    try {
+      await saveMealPlan(u.id, newPlan, week);
+    } catch (err) {
+      console.error('MealPlanProvider: error saving toggle state', err);
     }
 
     return { success: true };
@@ -1076,7 +1076,7 @@ export function MealPlanProvider({ children }) {
 
   // Single auto-save writer for the shared meal plan (exactly one timeout owner).
   useEffect(() => {
-    if (!hasData || !userId || isGuest || !currentWeekStarting) return undefined;
+    if (!hasData || !userId || isGuest || !currentWeekStarting || isLoading) return undefined;
     if (skipNextAutoSaveRef.current) {
       skipNextAutoSaveRef.current = false;
       return undefined;
@@ -1088,7 +1088,7 @@ export function MealPlanProvider({ children }) {
 
     return () => clearTimeout(timeoutId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mealPlan, currentWeekStarting, hasData, userId, isGuest]);
+  }, [mealPlan, currentWeekStarting, hasData, userId, isGuest, isLoading]);
 
   const stateValue = useMemo(
     () => ({
@@ -1126,7 +1126,6 @@ export function MealPlanProvider({ children }) {
       clearAllMeals,
       clearDay,
       clearMeal,
-      copyMeal,
       getMealStatus,
       loadMealPlanByWeek,
       saveCurrentMealPlan,

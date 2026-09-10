@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { estimateAndAdjust } from '../shared/lib/macroEstimator.js';
+import { buildUsdaToolInstructions } from '../shared/lib/mealPromptBuilder.js';
 import {
   calculateLoggedMealNutrition,
   computeUsdaMacros,
+  GENERATION_PORTION_BOUNDS,
   hasCompleteIngredientMacros,
   isWithinBudgetTolerance,
   macroErrors,
@@ -136,29 +138,37 @@ function expectConsistent(result) {
   expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
 }
 
-function expectWithinFivePercent(result, budget) {
-  expectConsistent(result);
-  expect(isWithinBudgetTolerance(result.macros, budget)).toBe(true);
+function expectGenerationBounds(result) {
+  for (const ing of result.ingredients) {
+    const bounds = GENERATION_PORTION_BOUNDS[ing.type];
+    if (!bounds) continue;
+    expect(ing.grams).toBeGreaterThanOrEqual(bounds.min);
+    expect(ing.grams).toBeLessThanOrEqual(bounds.max);
+  }
+}
+
+function gramsByName(result, name) {
+  return result.ingredients.find((i) => i.name === name)?.grams;
 }
 
 describe('computeUsdaMacros', () => {
   it('uses the sum of rounded ingredient rows when no scaling is needed', () => {
     const ingredients = [
-      { name: 'a', type: 'protein', grams: 100 },
-      { name: 'b', type: 'protein', grams: 100 },
-      { name: 'c', type: 'protein', grams: 100 },
+      { name: 'a', type: 'protein', grams: 120 },
+      { name: 'b', type: 'protein', grams: 120 },
+      { name: 'c', type: 'protein', grams: 120 },
     ];
     const usdaMap = {
       a: { fdc_id: 1, protein_per_100g: 0, carbs_per_100g: 0, fat_per_100g: 0, calories_per_100g: 1.14 },
       b: { fdc_id: 2, protein_per_100g: 0, carbs_per_100g: 0, fat_per_100g: 0, calories_per_100g: 1.14 },
       c: { fdc_id: 3, protein_per_100g: 0, carbs_per_100g: 0, fat_per_100g: 0, calories_per_100g: 1.14 },
     };
-    const budget = { calories: 3.42, protein: 0, carbs: 0, fat: 0 };
+    const budget = { calories: 4.104, protein: 0, carbs: 0, fat: 0 };
     const result = computeUsdaMacros(ingredients, usdaMap, budget);
 
     expect(result.scaled).toBe(false);
-    expect(result.ingredients.map((i) => i.calories)).toEqual([1.1, 1.1, 1.1]);
-    expect(result.macros).toEqual({ calories: 3.3, protein: 0, carbs: 0, fat: 0 });
+    expect(result.ingredients.map((i) => i.calories)).toEqual([1.4, 1.4, 1.4]);
+    expect(result.macros).toEqual({ calories: 4.2, protein: 0, carbs: 0, fat: 0 });
     expectConsistent(result);
   });
 
@@ -215,11 +225,12 @@ describe('computeUsdaMacros', () => {
     const tortilla = result.ingredients.find((i) => i.name === 'tortilla');
 
     expectConsistent(result);
-    expectWithinFivePercent(result, budget);
+    expectGenerationBounds(result);
     expect(Math.abs(result.macros.carbs - budget.carbs)).toBeLessThan(
       Math.abs(oldUsda.macros.carbs - budget.carbs)
     );
     expect(tortilla.grams).not.toBe(oldGrams);
+    expect(tortilla.grams).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.carb.max);
   });
 
   it('accounts for pasta contributing both carbs and protein', () => {
@@ -231,10 +242,14 @@ describe('computeUsdaMacros', () => {
     const budget = { calories: 650, protein: 48, carbs: 80, fat: 18 };
 
     const result = computeUsdaMacros(ingredients, USDA_MAP, budget);
-    expectWithinFivePercent(result, budget);
+    expectConsistent(result);
+    expectGenerationBounds(result);
     const pasta = result.ingredients.find((i) => i.name === 'pasta');
+    const chicken = result.ingredients.find((i) => i.name === 'chicken');
     expect(pasta.protein).toBeGreaterThan(0);
     expect(pasta.carbs).toBeGreaterThan(0);
+    expect(chicken.grams).toBeGreaterThanOrEqual(GENERATION_PORTION_BOUNDS.protein.min);
+    expect(pasta.grams).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.carb.max);
   });
 
   it('accounts for salmon contributing protein and fat', () => {
@@ -247,10 +262,14 @@ describe('computeUsdaMacros', () => {
     const budget = { calories: 680, protein: 42, carbs: 60, fat: 26 };
 
     const result = computeUsdaMacros(ingredients, USDA_MAP, budget);
-    expectWithinFivePercent(result, budget);
+    expectConsistent(result);
+    expectGenerationBounds(result);
+    expect(gramsByName(result, 'salmon')).toBeGreaterThanOrEqual(
+      GENERATION_PORTION_BOUNDS.protein.min
+    );
   });
 
-  it('converges a feasible chicken/rice plate to within 5% of budget', () => {
+  it('converges a feasible chicken/rice plate without collapsing portions', () => {
     const ingredients = [
       { name: 'chicken', type: 'protein', grams: 160 },
       { name: 'rice', type: 'carb', grams: 240 },
@@ -260,10 +279,39 @@ describe('computeUsdaMacros', () => {
     const budget = { calories: 620, protein: 45, carbs: 70, fat: 18 };
 
     const result = computeUsdaMacros(ingredients, USDA_MAP, budget);
-    expectWithinFivePercent(result, budget);
+    expectConsistent(result);
+    expectGenerationBounds(result);
     expect(result.macro_source).toBe('usda');
     expect(result.ingredients.every((i) => i.macro_source === 'usda')).toBe(true);
     expect(result.ingredients.every((i) => i.usda_fdc_id != null)).toBe(true);
+    expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
+    expect(gramsByName(result, 'chicken')).toBeGreaterThanOrEqual(
+      GENERATION_PORTION_BOUNDS.protein.min
+    );
+    expect(gramsByName(result, 'rice')).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.carb.max);
+  });
+
+  it('copies USDA description, data type, and confidence onto generated ingredients', () => {
+    const map = {
+      chicken: {
+        ...USDA_MAP.chicken,
+        description: 'Chicken, broiler, breast, meat only, cooked',
+        data_type: 'Foundation',
+        confidence: 0.82,
+      },
+    };
+    const result = computeUsdaMacros(
+      [{ name: 'chicken', type: 'protein', grams: 120 }],
+      map,
+      { calories: 198, protein: 37.2, carbs: 0, fat: 4.3 }
+    );
+    expect(result.ingredients[0]).toMatchObject({
+      usda_fdc_id: 171077,
+      usda_description: 'Chicken, broiler, breast, meat only, cooked',
+      usda_data_type: 'Foundation',
+      confidence: 0.82,
+    });
+    expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
   });
 
   it('converges usda_partial meals using USDA hits and type-density misses', () => {
@@ -281,8 +329,11 @@ describe('computeUsdaMacros', () => {
       'usda',
       'usda',
     ]);
-    expectWithinFivePercent(result, budget);
     expectConsistent(result);
+    expectGenerationBounds(result);
+    expect(gramsByName(result, 'chicken')).toBeGreaterThanOrEqual(
+      GENERATION_PORTION_BOUNDS.protein.min
+    );
   });
 
   it('returns a finite best-effort meal when the target is impossible', () => {
@@ -314,7 +365,71 @@ describe('computeUsdaMacros', () => {
     expect(option.macros).toEqual(sumIngredientMacros(option.meal_v2.ingredients));
     expect(option.fullDescription).toContain(`Cal: ${option.macros.calories}`);
     expect(option.fullDescription).toContain(`P: ${option.macros.protein}g`);
-    expectWithinFivePercent(computed, budget);
+    expectConsistent(computed);
+    expectGenerationBounds(computed);
+    expect(gramsByName(computed, 'chicken')).toBeGreaterThanOrEqual(
+      GENERATION_PORTION_BOUNDS.protein.min
+    );
+  });
+
+  it('does not collapse chicken or max a single rice to hit a high-carb dinner budget', () => {
+    const ingredients = [
+      { name: 'chicken', type: 'protein', grams: 140 },
+      { name: 'rice', type: 'carb', grams: 250 },
+      { name: 'broccoli', type: 'vegetable', grams: 140 },
+      { name: 'olive oil', type: 'fat', grams: 12 },
+    ];
+    const budget = { calories: 874, protein: 39, carbs: 120, fat: 26 };
+
+    const result = computeUsdaMacros(ingredients, USDA_MAP, budget);
+    expectConsistent(result);
+    expectGenerationBounds(result);
+
+    const chicken = gramsByName(result, 'chicken');
+    const rice = gramsByName(result, 'rice');
+    const broccoli = gramsByName(result, 'broccoli');
+    const oil = gramsByName(result, 'olive oil');
+
+    expect(chicken).toBeGreaterThanOrEqual(GENERATION_PORTION_BOUNDS.protein.min);
+    expect(chicken).toBeGreaterThan(100);
+    expect(rice).toBeLessThan(400);
+    expect(rice).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.carb.max);
+    expect(rice).toBeLessThanOrEqual(250);
+    expect(broccoli).toBeGreaterThanOrEqual(GENERATION_PORTION_BOUNDS.vegetable.min);
+    expect(broccoli).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.vegetable.max);
+    expect(oil).toBeGreaterThanOrEqual(GENERATION_PORTION_BOUNDS.fat.min);
+    expect(oil).toBeLessThanOrEqual(GENERATION_PORTION_BOUNDS.fat.max);
+    expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
+  });
+
+  it('does not invent a missing protein type just to chase the protein target', () => {
+    const ingredients = [
+      { name: 'broccoli', type: 'vegetable', grams: 150 },
+      { name: 'olive oil', type: 'fat', grams: 10 },
+    ];
+    const budget = { calories: 600, protein: 50, carbs: 70, fat: 18 };
+    const result = computeUsdaMacros(ingredients, USDA_MAP, budget);
+
+    expect(result.ingredients.map((i) => i.type).sort()).toEqual(['fat', 'vegetable']);
+    expectGenerationBounds(result);
+    expectConsistent(result);
+  });
+
+  it('is the shared scaler used by single generate, regenerate, and meal prep', () => {
+    const ingredients = [
+      { name: 'chicken', type: 'protein', grams: 140 },
+      { name: 'rice', type: 'carb', grams: 250 },
+      { name: 'broccoli', type: 'vegetable', grams: 140 },
+      { name: 'olive oil', type: 'fat', grams: 12 },
+    ];
+    const budget = { calories: 874, protein: 39, carbs: 120, fat: 26 };
+    const single = computeUsdaMacros(ingredients, USDA_MAP, budget);
+    const regenerate = computeUsdaMacros(ingredients, USDA_MAP, budget);
+    const mealPrep = formatPrepOption('Prep bowl', computeUsdaMacros(ingredients, USDA_MAP, budget));
+
+    expect(single.ingredients.map((i) => i.grams)).toEqual(regenerate.ingredients.map((i) => i.grams));
+    expect(mealPrep.meal_v2.ingredients.map((i) => i.grams)).toEqual(single.ingredients.map((i) => i.grams));
+    expect(mealPrep.macros).toEqual(single.macros);
   });
 });
 
@@ -382,6 +497,9 @@ describe('calculateLoggedMealNutrition', () => {
       fat: 11,
       usda_fdc_id: 101,
       macro_source: 'usda',
+      usda_description: 'Egg, whole, cooked',
+      usda_data_type: 'Foundation',
+      confidence: 0.8,
     });
     expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
     expect(result.macros).toEqual({
@@ -401,6 +519,18 @@ describe('calculateLoggedMealNutrition', () => {
     expect(optimized.ingredients.map((ing) => ing.grams)).not.toEqual([100, 100, 16, 50]);
   });
 
+  it('does not apply generation portion bounds to a logged chicken-rice bowl', () => {
+    const ingredients = [
+      { name: 'chicken', type: 'protein', grams: 73 },
+      { name: 'rice', type: 'carb', grams: 400 },
+      { name: 'broccoli', type: 'vegetable', grams: 225 },
+      { name: 'olive oil', type: 'fat', grams: 18 },
+    ];
+    const result = calculateLoggedMealNutrition(ingredients, USDA_MAP);
+    expect(result.ingredients.map((ing) => ing.grams)).toEqual([73, 400, 225, 18]);
+    expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
+  });
+
   it('marks a USDA miss as usda_partial with mixed provenance', () => {
     const usda = { ...LOGGED_USDA, avocado: null };
     const result = calculateLoggedMealNutrition(LOGGED_INGREDIENTS, usda);
@@ -410,5 +540,22 @@ describe('calculateLoggedMealNutrition', () => {
     expect(result.ingredients[3].usda_fdc_id).toBeNull();
     expect(result.ingredients[0].macro_source).toBe('usda');
     expect(result.macros).toEqual(sumIngredientMacros(result.ingredients));
+  });
+});
+
+describe('generation portion prompt', () => {
+  it('asks for USDA lookup and realistic cooked grams without fixed ranges', () => {
+    const prompt = buildUsdaToolInstructions({
+      calories: 874,
+      protein: 39,
+      carbs: 120,
+      fat: 26,
+    });
+    expect(prompt).toContain('lookup_nutrition');
+    expect(prompt).toMatch(/realistic COOKED gram amounts/i);
+    expect(prompt).not.toMatch(/constraints, not suggestions/i);
+    expect(prompt).not.toMatch(/120–250g cooked/);
+    expect(prompt).not.toMatch(/150–300g cooked/);
+    expect(prompt).not.toMatch(/MUST include 2\+ different carb ingredients/);
   });
 });

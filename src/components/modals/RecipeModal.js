@@ -1,5 +1,5 @@
-import React, { useMemo } from 'react';
-import { ChefHat, Clock, Download, Users, X } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { ChefHat, Clock, Copy, Download, Users, X } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -102,9 +102,10 @@ const SoftCard = ({ children, className = '' }) => (
   </div>
 );
 
-export const RecipeModal = ({ isOpen, onClose, recipe, title }) => {
+export const RecipeModal = ({ isOpen, onClose, recipe, prompt = null, title }) => {
   const parsed = useMemo(() => parseCookbookRecipe(recipe, title), [recipe, title]);
   const displayTitle = title || parsed.title || 'Recipe';
+  const [copied, setCopied] = useState(false);
 
   const downloadRecipe = () => {
     if (!recipe) return;
@@ -115,6 +116,17 @@ export const RecipeModal = ({ isOpen, onClose, recipe, title }) => {
     a.download = `${displayTitle.replace(/[^\w\s-]/g, '').trim() || 'recipe'}.txt`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const copyPrompt = async () => {
+    if (!prompt) return;
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
   };
 
   return (
@@ -249,6 +261,27 @@ export const RecipeModal = ({ isOpen, onClose, recipe, title }) => {
                 <p className="text-center text-sm font-medium text-muted-foreground">
                   No recipe available yet.
                 </p>
+              </SoftCard>
+            ) : null}
+
+            {prompt ? (
+              <SoftCard>
+                <div className="mb-2.5 flex items-center justify-between gap-2">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.9px] text-muted-foreground">
+                    AI prompt sent
+                  </p>
+                  <button
+                    type="button"
+                    onClick={copyPrompt}
+                    className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-bold text-primary hover:bg-primary/10"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {copied ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-gray-800 select-text">
+                  {prompt}
+                </pre>
               </SoftCard>
             ) : null}
           </div>

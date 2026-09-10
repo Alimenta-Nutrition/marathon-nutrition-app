@@ -151,7 +151,6 @@ export default function MealsPage() {
         }}
         onClearMeal={mealPlan.clearMeal}
         onClearDay={mealPlan.clearDay}
-        onClearAllMeals={mealPlan.clearAllMeals}
         onCopyMeal={mealPlan.copyMeal}
         onRegenerate={async (day, mealType, reason, context) => {
           const { workouts, tomorrowWorkouts } = await resolveWorkoutsForMealDay(day);

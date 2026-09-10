@@ -93,14 +93,10 @@ export const WeekNavigation = ({
 };
 
 export const QuickActionsRow = ({
-  hasMeals,
   onAnalytics,
   onGroceryList,
-  onMealPrep,
-  onLogMeal,
   loadingGroceryList,
   groceryRemaining,
-  canGenerate = true,
   animatedStyle,
 }) => {
   const { colors } = useTheme();
@@ -109,84 +105,44 @@ export const QuickActionsRow = ({
 
   return (
     <Animated.View style={[styles.quickActionsRow, animatedStyle]}>
-      {hasMeals ? (
-        <>
-          <TouchableOpacity
-            style={styles.quickActionBtn}
-            onPress={onAnalytics}
-            accessibilityLabel="Analytics"
-            accessibilityRole="button"
-          >
-            <Ionicons name="bar-chart-outline" size={16} color={colors.text} />
-            <Text style={styles.quickActionText}>Analytics</Text>
-          </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.quickActionBtn}
+        onPress={onAnalytics}
+        accessibilityLabel="Analytics"
+        accessibilityRole="button"
+      >
+        <Ionicons name="bar-chart-outline" size={16} color={colors.text} />
+        <Text style={styles.quickActionText}>Analytics</Text>
+      </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[
-              styles.quickActionBtn,
-              groceryLimitReached && styles.quickActionBtnDisabled,
-            ]}
-            onPress={onGroceryList}
-            disabled={loadingGroceryList}
-            accessibilityLabel="Grocery list"
-            accessibilityRole="button"
-          >
-            {loadingGroceryList ? (
-              <ActivityIndicator size="small" color={colors.primary} />
-            ) : (
-              <Ionicons
-                name="cart-outline"
-                size={16}
-                color={groceryLimitReached ? colors.textTertiary : colors.text}
-              />
-            )}
-            <Text
-              style={[
-                styles.quickActionText,
-                groceryLimitReached && styles.quickActionTextDisabled,
-              ]}
-            >
-              Grocery List
-            </Text>
-          </TouchableOpacity>
-        </>
-      ) : (
-        <>
-          <TouchableOpacity
-            style={[
-              styles.quickActionBtn,
-              !canGenerate && styles.quickActionBtnDisabled,
-            ]}
-            onPress={onMealPrep}
-            accessibilityLabel="Meal prep"
-            accessibilityRole="button"
-          >
-            <Ionicons
-              name="restaurant-outline"
-              size={16}
-              color={!canGenerate ? colors.textTertiary : colors.text}
-            />
-            <Text
-              style={[
-                styles.quickActionText,
-                !canGenerate && styles.quickActionTextDisabled,
-              ]}
-            >
-              Meal Prep
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.quickActionBtn}
-            onPress={onLogMeal}
-            accessibilityLabel="Log meal"
-            accessibilityRole="button"
-          >
-            <Ionicons name="create-outline" size={16} color={colors.text} />
-            <Text style={styles.quickActionText}>Log Meal</Text>
-          </TouchableOpacity>
-        </>
-      )}
+      <TouchableOpacity
+        style={[
+          styles.quickActionBtn,
+          groceryLimitReached && styles.quickActionBtnDisabled,
+        ]}
+        onPress={onGroceryList}
+        disabled={loadingGroceryList}
+        accessibilityLabel="Grocery list"
+        accessibilityRole="button"
+      >
+        {loadingGroceryList ? (
+          <ActivityIndicator size="small" color={colors.primary} />
+        ) : (
+          <Ionicons
+            name="cart-outline"
+            size={16}
+            color={groceryLimitReached ? colors.textTertiary : colors.text}
+          />
+        )}
+        <Text
+          style={[
+            styles.quickActionText,
+            groceryLimitReached && styles.quickActionTextDisabled,
+          ]}
+        >
+          Grocery List
+        </Text>
+      </TouchableOpacity>
     </Animated.View>
   );
 };
@@ -291,7 +247,7 @@ export const DaySelector = ({
 
     runWeekTransition(-1, () => {
       setVisualWeekStarting(prev);
-      onPreviousWeek();
+      onPreviousWeek?.(prev);
     });
   };
 
@@ -302,7 +258,7 @@ export const DaySelector = ({
 
     runWeekTransition(1, () => {
       setVisualWeekStarting(next);
-      onNextWeek();
+      onNextWeek?.(next);
     });
   };
 

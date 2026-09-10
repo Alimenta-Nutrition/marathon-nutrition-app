@@ -587,6 +587,42 @@ export const apiClient = {
     }
   },
 
+  async previewSingleMealPrompt(data) {
+    try {
+      const response = await fetchWithTimeout(getApiUrl(mealGenApiPath('/api/generate-single-meal')), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(withLocalDate({ ...data, previewPrompt: true })),
+      }, 20000);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorData;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { error: errorText || `HTTP ${response.status}: ${response.statusText}` };
+        }
+        return { success: false, ...errorData };
+      }
+
+      const text = await response.text();
+      if (!text || text.trim().length === 0) {
+        return { success: false, error: 'Empty response from server' };
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        console.error('JSON parse error:', e, 'Response text:', text);
+        return { success: false, error: 'Invalid JSON response from server' };
+      }
+    } catch (error) {
+      console.error('previewSingleMealPrompt fetch error:', error);
+      return { success: false, error: error.message || 'Network error' };
+    }
+  },
+
   async generateSingleMeal(data) {
     try {
       const response = await fetchWithTimeout(getApiUrl(mealGenApiPath('/api/generate-single-meal')), {

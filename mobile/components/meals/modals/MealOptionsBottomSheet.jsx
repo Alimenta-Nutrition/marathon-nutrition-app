@@ -117,7 +117,6 @@ export const MealOptionsBottomSheet = ({
   onRate,
   onEdit,
   onSaveMeal,
-  onCopy,
   onGetRecipe,
   onRegenerate,
   onDelete,
@@ -126,6 +125,7 @@ export const MealOptionsBottomSheet = ({
   savingMeal,
   canRegenerate = true,
   canGetRecipe = true,
+  isMealSaved = false,
 }) => {
   const { colors, isDarkMode } = useTheme();
   const styles = getStyles(colors, isDarkMode);
@@ -164,8 +164,14 @@ export const MealOptionsBottomSheet = ({
               onPress={onSaveMeal}
               disabled={savingMeal}
             >
-              <Ionicons name="bookmark-outline" size={22} color={colors.primary} />
-              <Text style={styles.bottomSheetOptionText}>Save meal</Text>
+              <Ionicons
+                name={isMealSaved ? 'bookmark' : 'bookmark-outline'}
+                size={22}
+                color={colors.primary}
+              />
+              <Text style={styles.bottomSheetOptionText}>
+                {isMealSaved ? 'Unsave meal' : 'Save meal'}
+              </Text>
               {savingMeal ? (
                 <ActivityIndicator
                   size="small"
@@ -173,13 +179,6 @@ export const MealOptionsBottomSheet = ({
                   style={{ marginLeft: 10 }}
                 />
               ) : null}
-            </TouchableOpacity>
-          ) : null}
-
-          {onCopy ? (
-            <TouchableOpacity style={styles.bottomSheetOption} onPress={onCopy}>
-              <Ionicons name="copy-outline" size={22} color={colors.primary} />
-              <Text style={styles.bottomSheetOptionText}>Copy meal</Text>
             </TouchableOpacity>
           ) : null}
 

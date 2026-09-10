@@ -96,6 +96,7 @@ export function normalizedMealToDisplayString(meal) {
 export function normalizedMealToV2(meal) {
   const ingredients = Array.isArray(meal?.ingredients) ? meal.ingredients : [];
   return {
+    id: meal?.id == null ? null : String(meal.id),
     meal_name: meal?.meal_name ?? null,
     macros: {
       calories: meal?.calories ?? null,
@@ -260,28 +261,25 @@ export async function loadMergedWebMealWeek({
   }
 
   const legacyMeals = legacyOk ? legacyOutcome.value?.meals || {} : {};
-  const resolvedWeekStarting = legacyOk
-    ? legacyOutcome.value?.weekStarting || start
-    : start;
   const normalizedMeals = normalizedOk ? normalizedOutcome.value || [] : [];
 
   const { week: mergedMeals, normalizedMealsBySlot } = mergeNormalizedMealsIntoLegacyWeek({
     legacyWeek: legacyMeals,
     normalizedMeals,
-    weekStarting: resolvedWeekStarting,
+    weekStarting: start,
   });
 
   const week = daySettingsOk
     ? mergeDaySettingsIntoWeek({
         week: mergedMeals,
         daySettings: daySettingsOutcome?.value || [],
-        weekStarting: resolvedWeekStarting,
+        weekStarting: start,
       })
     : mergedMeals;
 
   return {
     week,
-    weekStarting: resolvedWeekStarting,
+    weekStarting: start,
     normalizedMealsBySlot,
     legacyOk,
     normalizedOk,

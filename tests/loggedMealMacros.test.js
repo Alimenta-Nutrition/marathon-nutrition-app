@@ -45,4 +45,44 @@ describe('scaleIngredientByGrams', () => {
       fat: round1(scaled.fat + bagel.fat),
     });
   });
+
+  it('recalculates a snack ingredient from 180g to 220g without another lookup', () => {
+    const apple = {
+      name: 'apple',
+      type: 'carb',
+      grams: 180,
+      calories: 93.6,
+      protein: 0.5,
+      carbs: 25.2,
+      fat: 0.4,
+      usda_fdc_id: 168191,
+      macro_source: 'usda',
+    };
+    const peanutButter = {
+      name: 'peanut butter',
+      type: 'fat',
+      grams: 32,
+      calories: 188.2,
+      protein: 8,
+      carbs: 6.4,
+      fat: 16,
+      usda_fdc_id: 174272,
+      macro_source: 'usda',
+    };
+
+    const scaled = scaleIngredientByGrams(apple, 220);
+    expect(scaled.grams).toBe(220);
+    expect(scaled.calories).toBe(round1(93.6 * (220 / 180)));
+    expect(scaled.protein).toBe(round1(0.5 * (220 / 180)));
+    expect(scaled.carbs).toBe(round1(25.2 * (220 / 180)));
+    expect(scaled.fat).toBe(round1(0.4 * (220 / 180)));
+    expect(scaled.usda_fdc_id).toBe(168191);
+
+    expect(sumLoggedIngredientMacros([scaled, peanutButter])).toEqual({
+      calories: round1(scaled.calories + peanutButter.calories),
+      protein: round1(scaled.protein + peanutButter.protein),
+      carbs: round1(scaled.carbs + peanutButter.carbs),
+      fat: round1(scaled.fat + peanutButter.fat),
+    });
+  });
 });

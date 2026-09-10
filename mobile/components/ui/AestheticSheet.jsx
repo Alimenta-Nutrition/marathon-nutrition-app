@@ -55,7 +55,10 @@ export function AestheticSheet({
             <View style={[styles.bgCircle, styles.bgCirclePeach]} />
           </View>
 
-          <View style={styles.modalInner}>
+          <KeyboardAvoidingView
+            style={styles.modalInner}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
             <View style={styles.handleRow}>
               <View style={styles.handle} />
             </View>
@@ -112,7 +115,7 @@ export function AestheticSheet({
             )}
 
             {footer}
-          </View>
+          </KeyboardAvoidingView>
         </SafeAreaView>
       </View>
     </Modal>
@@ -431,6 +434,7 @@ const getDialogStyles = (colors, isDarkMode, maxWidth) =>
       paddingHorizontal: 16,
       paddingBottom: 8,
       zIndex: 1,
+      flexShrink: 1,
     },
     footer: {
       padding: 16,

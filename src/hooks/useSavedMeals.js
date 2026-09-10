@@ -40,7 +40,7 @@ export const useSavedMeals = (user, isGuest) => {
   }, [savedMeals]);
 
   // Save a new meal
-  const saveMealToFavorites = async (mealType, fullDescription) => {
+  const saveMealToFavorites = async (mealType, fullDescription, mealV2 = null) => {
     if (!user || isGuest) {
       return { success: false, error: 'Must be logged in to save meals' };
     }
@@ -60,6 +60,10 @@ export const useSavedMeals = (user, isGuest) => {
       mealType,
       name,
       fullDescription,
+      ingredients: mealV2?.ingredients,
+      macros: mealV2?.macros,
+      macroSource: mealV2?.macro_source,
+      provider: mealV2?.provider,
     });
 
     if (error) {

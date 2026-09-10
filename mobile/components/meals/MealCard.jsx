@@ -10,6 +10,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../context/ThemeContext';
 import { getMealSlotDisplay } from '../../../shared/lib/mealSlotState';
+import { macroColors } from '../../../shared/lib/macroColors';
 
 const MEAL_LABELS = {
   breakfast: 'Breakfast',

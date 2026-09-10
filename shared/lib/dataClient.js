@@ -1,4 +1,5 @@
 import { supabase } from '../services/getSupabase';
+import { buildSavedMealRow, isUnknownColumnError } from './savedMealStructure';
 
 // ================================================
 // Helpers
@@ -454,23 +455,28 @@ export async function saveMeal(userId, mealData) {
   }
 
   // Extract macros from description if present
-  const macros = extractMacrosFromDescription(mealData.fullDescription || '');
+  const structuredRow = buildSavedMealRow(userId, mealData, {
+    includeStructure: true,
+    includeTimesUsed: true,
+  });
+  const baseRow = buildSavedMealRow(userId, mealData, {
+    includeStructure: false,
+    includeTimesUsed: true,
+  });
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from('saved_meals')
-    .insert({
-      user_id: userId,
-      meal_type: mealData.mealType,
-      name: mealData.name,
-      full_description: mealData.fullDescription,
-      calories: macros.calories || null,
-      protein: macros.protein || null,
-      carbs: macros.carbs || null,
-      fat: macros.fat || null,
-      times_used: 1,
-    })
+    .insert(structuredRow)
     .select()
     .single();
+
+  if (error && isUnknownColumnError(error)) {
+    ({ data, error } = await supabase
+      .from('saved_meals')
+      .insert(baseRow)
+      .select()
+      .single());
+  }
 
   if (error) {
     console.error('❌ Save meal error:', error);

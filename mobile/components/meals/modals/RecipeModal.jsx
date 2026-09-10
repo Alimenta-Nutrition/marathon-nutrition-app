@@ -1,10 +1,13 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ActivityIndicator,
-  ScrollView,
+  TouchableOpacity,
+  Share,
+  Alert,
+  Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../../context/ThemeContext';
@@ -93,7 +96,24 @@ const parseCookbookRecipe = (raw, fallbackTitle) => {
   return { title, servings, time, ingredients, steps, notes };
 };
 
-export const RecipeModal = ({ visible, recipe, mealName, onClose, onShare, loading = false }) => {
+async function copyPromptText(text) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return 'clipboard';
+  }
+  await Share.share({ message: text, title: 'AI Prompt' });
+  return 'share';
+}
+
+export const RecipeModal = ({
+  visible,
+  recipe,
+  prompt = null,
+  mealName,
+  onClose,
+  onShare,
+  loading = false,
+}) => {
   const { colors, isDarkMode } = useTheme();
   const styles = getStyles(colors, isDarkMode);
   const parsed = useMemo(
@@ -101,6 +121,24 @@ export const RecipeModal = ({ visible, recipe, mealName, onClose, onShare, loadi
     [recipe, mealName]
   );
   const displayTitle = mealName || parsed.title || 'Recipe';
+  const [copying, setCopying] = useState(false);
+
+  const handleCopyPrompt = useCallback(async () => {
+    if (!prompt || copying) return;
+    setCopying(true);
+    try {
+      const method = await copyPromptText(prompt);
+      if (method === 'clipboard') {
+        Alert.alert('Copied', 'Prompt copied to the clipboard.');
+      }
+    } catch (err) {
+      if (err?.message && !/share.*dismiss|cancel/i.test(String(err.message))) {
+        Alert.alert('Could not copy', err.message || 'Please select the text and copy it.');
+      }
+    } finally {
+      setCopying(false);
+    }
+  }, [prompt, copying]);
 
   return (
     <AestheticSheet
@@ -194,6 +232,29 @@ export const RecipeModal = ({ visible, recipe, mealName, onClose, onShare, loadi
             Ingredient amounts are AI-generated to approximately match this meal's stored macros.
             This view does not show per-ingredient nutrition values.
           </NutritionCitation>
+
+          {prompt ? (
+            <AestheticCard>
+              <View style={styles.promptHeader}>
+                <AestheticSectionLabel>AI PROMPT SENT</AestheticSectionLabel>
+                <TouchableOpacity
+                  onPress={handleCopyPrompt}
+                  disabled={copying}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy prompt"
+                >
+                  <View style={styles.copyRow}>
+                    <Ionicons name="copy-outline" size={16} color={colors.primary} />
+                    <Text style={styles.copyLabel}>{copying ? 'Copying…' : 'Copy'}</Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+              <Text selectable style={styles.promptText}>
+                {prompt}
+              </Text>
+            </AestheticCard>
+          ) : null}
         </>
       )}
     </AestheticSheet>
@@ -308,5 +369,28 @@ const getStyles = (colors, isDarkMode) =>
       fontWeight: '500',
       color: colors.textSecondary,
       lineHeight: 22,
+    },
+    promptHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 8,
+    },
+    copyRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      marginBottom: 10,
+    },
+    copyLabel: {
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.primary,
+    },
+    promptText: {
+      fontSize: 12,
+      fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+      color: colors.text,
+      lineHeight: 18,
     },
   });

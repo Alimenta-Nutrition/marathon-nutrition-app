@@ -5,12 +5,14 @@ export const DAILY_LIMITS = {
   meal_generation: 10,
   recipe_generation: 5,
   grocery_list: 3,
+  food_logging: 20,
 };
 
 const DEFAULT_COUNTS = {
   meal_generation: 0,
   recipe_generation: 0,
   grocery_list: 0,
+  food_logging: 0,
 };
 
 const getTodayDate = () => new Date().toISOString().split('T')[0];
