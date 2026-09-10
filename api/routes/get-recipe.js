@@ -17,7 +17,7 @@
  *   mealId?,              // additive: load this user's normalized meal + ingredients
  * }
  *
- * Returns: { success, recipe (display string), structured (JSON) }
+ * Returns: { success, recipe (display string), structured (JSON), prompt }
  */
 
 import OpenAI from 'openai';
@@ -352,7 +352,7 @@ export default async function handler(req, res) {
     }
 
     const recipe = toCookbookText(structured, useStructured ? macros : null);
-    return res.status(200).json({ success: true, recipe, structured });
+    return res.status(200).json({ success: true, recipe, structured, prompt });
   } catch (error) {
     console.error('Recipe error:', error);
     return res.status(500).json({ success: false, error: error.message });

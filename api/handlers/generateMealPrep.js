@@ -5,7 +5,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { computeNutritionTargets, withNumericIntensities, deriveWorkoutTiming } from '../../shared/lib/tdeeCalc.js';
 import { estimateAndAdjust } from '../../shared/lib/macroEstimator.js';
-import { buildUsdaToolInstructions } from '../../shared/lib/mealPromptBuilder.js';
+import { buildMealPrepPrompt } from '../../shared/lib/mealPromptBuilder.js';
 import { validateIngredients } from '../../shared/lib/validateIngredients.js';
 import { completeJSON, completeMealWithUsda, isHighDemandError, OPENAI_MEAL_MODEL } from '../lib/aiCompletion.js';
 import { parseAIJson } from '../lib/parseAIJson.js';
@@ -33,65 +33,6 @@ function roundMacrosInt(macros) {
     carbs: Math.round(macros.carbs),
     fat: Math.round(macros.fat),
   };
-}
-
-function buildMealPrepPrompt(
-  rawMealType,
-  avgBudget,
-  numServings,
-  dietaryRestrictions,
-  likes,
-  cuisines,
-  dislikes,
-  useUsda = false
-) {
-  const densityOrTool = useUsda
-    ? buildUsdaToolInstructions(avgBudget)
-    : `Density guide (to size portions):
-- 1g protein food ≈ 0.25g protein, 0.10g fat
-- 1g cooked carb food ≈ 0.23g carbs
-- 1g vegetable ≈ 0.06g carbs
-- 1g added fat (oil/butter) ≈ 1.0g fat`;
-
-  return `You are a sports nutritionist creating meal prep options for an athlete.
-
-TASK: Create exactly 4 different ${rawMealType} meal prep recipes, each making ${numServings} servings.
-
-PER-SERVING MACRO TARGETS:
-- Calories: ~${avgBudget.calories} kcal
-- Protein: ~${avgBudget.protein}g
-- Carbs: ~${avgBudget.carbs}g
-- Fat: ~${avgBudget.fat}g
-
-${densityOrTool}
-
-${dietaryRestrictions ? `DIETARY RESTRICTIONS (MUST follow): ${dietaryRestrictions}` : ''}
-${likes ? `FOODS/CUISINES THE USER ENJOYS (rotate through these): ${likes}${cuisines ? ', ' + cuisines : ''}` : ''}
-${dislikes ? `DISLIKED FOODS (NEVER use any of these): ${dislikes}` : ''}
-
-RULES:
-1. Recipes must be batch-cookable and reheat well
-2. Return PER-SERVING ingredient amounts (cooked weights)
-3. Each option should use a different protein source
-4. Include a brief prep description and estimated prep time
-5. Ingredient types must be: protein, carb, vegetable, or fat
-6. NEVER include any disliked foods — double check each ingredient
-7. Keep recipes easy for an average home cook — common ingredients, straightforward techniques, nothing overly complicated
-
-Respond with ONLY valid JSON:
-{
-  "options": [
-    {
-      "meal_name": "...",
-      "description": "Brief description of the dish",
-      "prep_time": "30 mins",
-      "prep_reason": "Why this is good for meal prep",
-      "ingredients": [
-        { "name": "...", "type": "protein|carb|vegetable|fat", "grams": 0 }
-      ]
-    }
-  ]
-}`;
 }
 
 function emptyPrepOption(opt) {
@@ -215,18 +156,13 @@ export function createGenerateMealPrepHandler(provider) {
       };
 
       const numServings = days.length;
-      const likes = foodPreferences?.likes || '';
-      const cuisines = foodPreferences?.cuisine_favorites || foodPreferences?.cuisines || '';
-
-      const promptParts = [
-        rawMealType,
-        avgBudget,
+      const promptArgs = {
+        mealType: rawMealType,
+        macroBudget: avgBudget,
         numServings,
+        foodPreferences,
         dietaryRestrictions,
-        likes,
-        cuisines,
-        dislikes,
-      ];
+      };
 
       console.log(`🥘 Generating ${rawMealType} meal prep (${provider}, ${numServings} servings)...`);
 
@@ -240,7 +176,7 @@ export function createGenerateMealPrepHandler(provider) {
       if (provider === 'openai') {
         const usdaStarted = Date.now();
         try {
-          const prompt = buildMealPrepPrompt(...promptParts, true);
+          const prompt = buildMealPrepPrompt({ ...promptArgs, useUsda: true });
           const { parsed, toolRounds, usdaResults } = await completeMealWithUsda({
             prompt,
             reasoningEffort: 'none',
@@ -312,7 +248,7 @@ export function createGenerateMealPrepHandler(provider) {
           console.error(
             `USDA meal-prep failed, falling back to completeJSON: ${usdaErr?.message || usdaErr}`
           );
-          const prompt = buildMealPrepPrompt(...promptParts, false);
+          const prompt = buildMealPrepPrompt({ ...promptArgs, useUsda: false });
           const rawText = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
           let data;
           try {
@@ -340,7 +276,7 @@ export function createGenerateMealPrepHandler(provider) {
           );
         }
       } else {
-        const prompt = buildMealPrepPrompt(...promptParts, false);
+        const prompt = buildMealPrepPrompt({ ...promptArgs, useUsda: false });
         const rawText = await completeJSON(provider, { prompt, ...AI_CONFIG[provider] });
         let data;
         try {
