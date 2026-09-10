@@ -10,7 +10,7 @@ import { dateFromWeekStartingAndDay, getMealsForRange, weekDateRange } from '../
 import {
   aggregateStructuredIngredients,
   leftoverLegacyMealStrings,
-} from '../../shared/lib/aggregateGroceryIngredients.js';
+} from '../lib/aggregateGroceryIngredients.js';
 import { buildGroceryPrompt } from '../lib/groceryPrompt.js';
 
 const supabase = createClient(

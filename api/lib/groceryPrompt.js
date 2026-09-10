@@ -3,7 +3,7 @@
  * legacy meal strings use the previous name-extraction fallback.
  */
 
-import { formatAggregatedIngredientLine } from '../../shared/lib/aggregateGroceryIngredients.js';
+import { formatAggregatedIngredientLine } from './aggregateGroceryIngredients.js';
 
 export function buildGroceryPrompt({ aggregated = [], legacyMeals = [] }) {
   const hasStructured = aggregated.length > 0;
